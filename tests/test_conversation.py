@@ -1,0 +1,3675 @@
+"""Tests for the STT Assistant conversation entity platform."""
+
+import asyncio
+import contextlib
+import inspect
+import logging
+import sys
+from collections import UserList
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from types import ModuleType, SimpleNamespace
+from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from homeassistant.components.conversation.const import HOME_ASSISTANT_AGENT
+from homeassistant.components.conversation.models import ConversationInput
+from homeassistant.core import Context
+from homeassistant.helpers import intent
+
+import custom_components.stt_assistant as stt_assistant
+import custom_components.stt_assistant.conversation as conversation_platform
+from custom_components.stt_assistant import _discover_pipeline_languages
+from custom_components.stt_assistant.candidate import Candidate
+from custom_components.stt_assistant.const import (
+    CONVERSATION_INPUT_OPTIONAL_FIELDS,
+    DATA_RUNTIME,
+    DEFAULT_HOTWORD_MIN_CONFIDENCE,
+    DOMAIN,
+    ConfigKey,
+    ConversationInputField,
+    FallbackReason,
+)
+from custom_components.stt_assistant.conversation import (
+    STTAssistantConversationEntity,
+    async_setup_entry,
+)
+from custom_components.stt_assistant.indexer import CanonicalIndex, build_index
+from custom_components.stt_assistant.ranking import (
+    ConfidenceGateDecision,
+    RankedCandidate,
+    ScoreBreakdown,
+    evaluate_confidence_gates,
+)
+from custom_components.stt_assistant.recognition import (
+    RecognitionKind,
+    RecognitionObservation,
+)
+from custom_components.stt_assistant.runtime import STTAssistantRuntime
+from custom_components.stt_assistant.utils import (
+    normalize_hotword_list,
+    resolve_entry_hotword_options,
+    wildcard_slot_names,
+)
+
+
+class MockConversationInput(ConversationInput):
+    """Mock for ConversationInput."""
+
+    def __init__(self, text: str, language: str = "vi", conversation_id: str = "conv-1") -> None:
+        """Initialize."""
+        sig = inspect.signature(super().__init__)
+        kwargs: dict[str, Any] = {
+            ConversationInputField.TEXT: text,
+            ConversationInputField.CONTEXT: Context(),
+            ConversationInputField.CONVERSATION_ID: conversation_id,
+            ConversationInputField.DEVICE_ID: None,
+            ConversationInputField.LANGUAGE: language,
+        }
+        if ConversationInputField.AGENT_ID in sig.parameters:
+            kwargs[ConversationInputField.AGENT_ID] = "test_agent"
+        if ConversationInputField.SATELLITE_ID in sig.parameters:
+            kwargs[ConversationInputField.SATELLITE_ID] = None
+        super().__init__(**kwargs)
+        if not hasattr(self, ConversationInputField.AGENT_ID):
+            self.agent_id = "test_agent"
+        if not hasattr(self, ConversationInputField.SATELLITE_ID):
+            self.satellite_id = None
+
+
+class MockConversationResult:
+    """Mock for ConversationResult."""
+
+    def __init__(self, response: Any, conversation_id: str) -> None:
+        """Initialize."""
+        self.response = response
+        self.conversation_id = conversation_id
+
+
+class MockIntentResponse:
+    """Mock for IntentResponse."""
+
+    def __init__(self, language: str) -> None:
+        """Initialize."""
+        self.language = language
+        self.error_code = None
+
+    def async_set_error(self, code: Any, message: str) -> None:
+        """Set error."""
+        self.error_code = code
+
+
+@pytest.mark.asyncio
+async def test_delegate_text_filters_newer_home_assistant_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Delegate through the argument set supported by the installed HA release."""
+    entry = MagicMock()
+    entry.entry_id = "test_entry"
+    entry.options = {}
+    entity = STTAssistantConversationEntity(entry, STTAssistantRuntime())
+    entity.hass = MagicMock()
+    user_input = MockConversationInput("turn on the light", "en")
+    user_input.satellite_id = "assist_satellite.kitchen"
+    user_input.extra_system_prompt = "stay local"
+    result = MagicMock()
+    converse = AsyncMock(return_value=result)
+    monkeypatch.setattr(conversation_platform.conversation, "async_converse", converse)
+    monkeypatch.setattr(
+        conversation_platform,
+        "_ASYNC_CONVERSE_PARAMETERS",
+        frozenset(
+            {
+                "hass",
+                ConversationInputField.TEXT,
+                ConversationInputField.CONVERSATION_ID,
+                ConversationInputField.CONTEXT,
+                ConversationInputField.LANGUAGE,
+                ConversationInputField.AGENT_ID,
+                ConversationInputField.DEVICE_ID,
+            }
+        ),
+    )
+
+    assert await entity._delegate_text(user_input.text, user_input, primary=True) is result
+    converse.assert_awaited_once_with(
+        entity.hass,
+        user_input.text,
+        user_input.conversation_id,
+        user_input.context,
+        language=user_input.language,
+        agent_id=HOME_ASSISTANT_AGENT,
+        device_id=user_input.device_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_delegate_text_forwards_newer_home_assistant_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forward newer arguments when the installed HA release supports them."""
+    entry = MagicMock()
+    entry.entry_id = "test_entry"
+    entry.options = {}
+    entity = STTAssistantConversationEntity(entry, STTAssistantRuntime())
+    entity.hass = MagicMock()
+    user_input = MockConversationInput("turn on the light", "en")
+    user_input.satellite_id = "assist_satellite.kitchen"
+    user_input.extra_system_prompt = "stay local"
+    result = MagicMock()
+    converse = AsyncMock(return_value=result)
+    monkeypatch.setattr(conversation_platform.conversation, "async_converse", converse)
+    monkeypatch.setattr(
+        conversation_platform,
+        "_ASYNC_CONVERSE_PARAMETERS",
+        frozenset(CONVERSATION_INPUT_OPTIONAL_FIELDS),
+    )
+
+    assert await entity._delegate_text(user_input.text, user_input, primary=True) is result
+    converse.assert_awaited_once_with(
+        entity.hass,
+        user_input.text,
+        user_input.conversation_id,
+        user_input.context,
+        language=user_input.language,
+        agent_id=HOME_ASSISTANT_AGENT,
+        device_id=user_input.device_id,
+        **{
+            ConversationInputField.SATELLITE_ID: user_input.satellite_id,
+            ConversationInputField.EXTRA_SYSTEM_PROMPT: user_input.extra_system_prompt,
+        },
+    )
+
+
+async def _executor_job_returning_empty_snapshot_index(target: Any, *args: Any, **kwargs: Any):
+    """Mock executor work and return an empty index for snapshot builds."""
+    if getattr(target, "__name__", None) == "_build_index_from_snapshot":
+        return build_index("vi", [])
+    return target(*args, **kwargs)
+
+
+async def _executor_job_returning_empty_build_index(target: Any, *args: Any, **kwargs: Any):
+    """Mock executor work and return an empty index for direct index builds."""
+    if getattr(target, "__name__", None) == "build_index":
+        return build_index("vi", [])
+    return target(*args, **kwargs)
+
+
+def _active_pipeline_data(context: Context, pipeline: Any) -> SimpleNamespace:
+    """Return Home Assistant pipeline-run state matching one request context."""
+    run = SimpleNamespace(context=context, pipeline=pipeline)
+    return SimpleNamespace(pipeline_runs=SimpleNamespace(_pipeline_runs={"pipeline": {"run": run}}))
+
+
+def _mock_assist_pipeline_const(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provide the Assist Pipeline domain without importing optional integration dependencies."""
+    package_name = "homeassistant.components.assist_pipeline"
+    package_module = ModuleType(package_name)
+    const_module = ModuleType(f"{package_name}.const")
+    package_attrs = cast(Any, package_module)
+    const_attrs = cast(Any, const_module)
+    package_attrs.__path__ = []
+    package_attrs.const = const_module
+    const_attrs.DOMAIN = "assist_pipeline"
+    monkeypatch.setitem(sys.modules, package_name, package_module)
+    monkeypatch.setitem(sys.modules, f"{package_name}.const", const_module)
+
+
+@pytest.fixture(autouse=True)
+def _default_live_recognition(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep existing conversation tests focused while preflight has dedicated coverage."""
+
+    async def observe(_hass: Any, _user_input: Any, _text: str) -> RecognitionObservation:
+        """Return a default executable live-recognition observation."""
+        return RecognitionObservation(
+            kind=RecognitionKind.INTENT,
+            intent_name="HassTurnOn",
+        )
+
+    monkeypatch.setattr(
+        "custom_components.stt_assistant.conversation.async_observe_delegated_text",
+        observe,
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_setup_entry() -> None:
+    """Test setting up the conversation platform entry."""
+    hass = MagicMock()
+    config_entry = MagicMock()
+    config_entry.entry_id = "test_entry"
+    runtime = STTAssistantRuntime()
+    hass.data = {DOMAIN: {"test_entry": {DATA_RUNTIME: runtime}}}
+
+    async_add_entities = MagicMock()
+
+    await async_setup_entry(hass, config_entry, async_add_entities)
+    async_add_entities.assert_called_once()
+
+    hass.data = {DOMAIN: {"test_entry": {DATA_RUNTIME: None}}}
+    with pytest.raises(RuntimeError, match="runtime is not loaded"):
+        await async_setup_entry(hass, config_entry, async_add_entities)
+
+
+@pytest.mark.asyncio
+async def test_conversation_entity_lifecycle() -> None:
+    """Test conversation entity added to and removed from hass."""
+    entry = MagicMock()
+    entry.entry_id = "test_entry"
+    runtime = STTAssistantRuntime()
+
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock()
+
+    with (
+        patch("homeassistant.components.conversation.async_set_agent") as mock_set,
+        patch("homeassistant.components.conversation.async_unset_agent") as mock_unset,
+    ):
+        await entity.async_added_to_hass()
+        mock_set.assert_called_once_with(entity.hass, entry, entity)
+
+        await entity.async_will_remove_from_hass()
+        mock_unset.assert_called_once_with(entity.hass, entry)
+
+
+@pytest.mark.asyncio
+async def test_conversation_entity_properties_and_reload() -> None:
+    """Test simple property getters and index reload callbacks."""
+    entry = MagicMock()
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock()
+
+    assert entity.supported_languages == "*"
+
+    mock_index = MagicMock()
+    mock_index.language = "en"
+    runtime.set_index(mock_index)
+    runtime.indexes["en"] = MagicMock()
+    assert "en" in runtime.indexes
+    with patch.object(
+        STTAssistantRuntime,
+        "async_clear_index",
+        AsyncMock(side_effect=lambda hass, language=None: runtime.clear_index(language)),
+    ) as mock_clear:
+        await entity.async_reload("en-US")
+        mock_clear.assert_awaited_once_with(entity.hass, "en")
+    assert "en" not in runtime.indexes
+
+
+@pytest.mark.asyncio
+async def test_async_process_uses_legacy_request_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Call the request processor directly when the HA base has no chat lifecycle."""
+    entry = MagicMock()
+    entity = STTAssistantConversationEntity(entry, STTAssistantRuntime())
+    user_input = MockConversationInput("turn on the light", "en")
+    expected = MagicMock()
+    request_process = AsyncMock(return_value=expected)
+    base_process = AsyncMock()
+    base_entity = conversation_platform.conversation.ConversationEntity
+    monkeypatch.delattr(base_entity, "_async_handle_message", raising=False)
+
+    with (
+        patch.object(entity, "_async_process_request", request_process),
+        patch.object(base_entity, "async_process", base_process),
+    ):
+        assert await entity.async_process(user_input) is expected
+
+    request_process.assert_awaited_once_with(user_input)
+    base_process.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_async_process_uses_modern_home_assistant_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Delegate to the HA base processor when it exposes the chat lifecycle."""
+    entry = MagicMock()
+    entity = STTAssistantConversationEntity(entry, STTAssistantRuntime())
+    user_input = MockConversationInput("turn on the light", "en")
+    expected = MagicMock()
+    request_process = AsyncMock()
+    base_process = AsyncMock(return_value=expected)
+    base_entity = conversation_platform.conversation.ConversationEntity
+    monkeypatch.setattr(base_entity, "_async_handle_message", object(), raising=False)
+
+    with (
+        patch.object(entity, "_async_process_request", request_process),
+        patch.object(base_entity, "async_process", base_process),
+    ):
+        assert await entity.async_process(user_input) is expected
+
+    base_process.assert_awaited_once_with(user_input)
+    request_process.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_conversation_entity_prepare() -> None:
+    """Test async_prepare index load and rebuild flows."""
+    entry = MagicMock()
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock()
+    entity.hass.async_add_executor_job = AsyncMock()
+
+    runtime.indexes["en"] = MagicMock()
+    with patch.object(
+        STTAssistantRuntime, "async_load_index_from_store", AsyncMock()
+    ) as mock_load:
+        await entity.async_prepare("en")
+        mock_load.assert_not_called()
+
+    del runtime.indexes["en"]
+    with patch.object(
+        STTAssistantRuntime, "async_load_index_from_store", AsyncMock(return_value=MagicMock())
+    ) as mock_load:
+        await entity.async_prepare("en")
+        mock_load.assert_called_once()
+
+    with (
+        patch.object(
+            STTAssistantRuntime, "async_load_index_from_store", AsyncMock(return_value=None)
+        ) as mock_load,
+        patch.object(
+            STTAssistantRuntime, "async_rebuild_index", AsyncMock(return_value=MagicMock())
+        ) as mock_rebuild,
+    ):
+        await entity.async_prepare("en")
+        mock_load.assert_called_once()
+        mock_rebuild.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_conversation_entity_prepare_suppresses_ranking_prepare_error() -> None:
+    """Test async_prepare suppresses ranking preparation failure without propagating."""
+    entry = MagicMock()
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock()
+    runtime.indexes["en"] = MagicMock()
+
+    with patch.object(
+        STTAssistantRuntime,
+        "async_prepare_language_ranking",
+        AsyncMock(side_effect=RuntimeError("ranking prep failed")),
+    ) as mock_prep:
+        await entity.async_prepare("en")
+        mock_prep.assert_awaited_once_with(entity.hass, "en")
+
+
+@pytest.mark.asyncio
+async def test_conversation_entity_prepare_prepares_default_agent() -> None:
+    """Test async_prepare prepares the default conversation agent."""
+    entry = MagicMock()
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock()
+    runtime.indexes["en"] = MagicMock()
+    mock_agent = MagicMock()
+    mock_agent.async_prepare = AsyncMock()
+
+    with (
+        patch.object(STTAssistantRuntime, "async_prepare_language_ranking", AsyncMock()),
+        patch(
+            "custom_components.stt_assistant.preparation.async_get_agent",
+            return_value=mock_agent,
+        ) as mock_get_agent,
+    ):
+        await entity.async_prepare("en")
+        mock_get_agent.assert_called_once_with(entity.hass, HOME_ASSISTANT_AGENT)
+        mock_agent.async_prepare.assert_awaited_once_with("en")
+
+
+@pytest.mark.asyncio
+async def test_conversation_entity_prepare_suppresses_default_agent_error() -> None:
+    """Test async_prepare suppresses default agent prepare failure without propagating."""
+    entry = MagicMock()
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock()
+    runtime.indexes["en"] = MagicMock()
+    mock_agent = MagicMock()
+    mock_agent.async_prepare = AsyncMock(side_effect=RuntimeError("default agent prep failed"))
+
+    with (
+        patch.object(STTAssistantRuntime, "async_prepare_language_ranking", AsyncMock()),
+        patch(
+            "custom_components.stt_assistant.preparation.async_get_agent",
+            return_value=mock_agent,
+        ),
+    ):
+        await entity.async_prepare("en")
+        mock_agent.async_prepare.assert_awaited_once_with("en")
+
+
+@pytest.mark.asyncio
+async def test_conversation_entity_prepare_handles_sync_or_missing_default_agent() -> None:
+    """Test async_prepare handles missing or sync default conversation agent."""
+    entry = MagicMock()
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock()
+    runtime.indexes["en"] = MagicMock()
+
+    # 1. Missing agent
+    with (
+        patch.object(STTAssistantRuntime, "async_prepare_language_ranking", AsyncMock()),
+        patch(
+            "custom_components.stt_assistant.preparation.async_get_agent",
+            return_value=None,
+        ),
+    ):
+        await entity.async_prepare("en")
+
+    # 2. Agent with sync prepare
+    runtime.invalidate_language_preparation("en")
+    mock_sync_agent = MagicMock()
+    mock_sync_agent.async_prepare = MagicMock(return_value=None)
+    with (
+        patch.object(STTAssistantRuntime, "async_prepare_language_ranking", AsyncMock()),
+        patch(
+            "custom_components.stt_assistant.preparation.async_get_agent",
+            return_value=mock_sync_agent,
+        ),
+    ):
+        await entity.async_prepare("en")
+        mock_sync_agent.async_prepare.assert_called_once_with("en")
+
+
+@pytest.mark.asyncio
+async def test_async_process_error_handling() -> None:
+    """Test exception during async_process generates error result and updates diagnostics."""
+    entry = MagicMock()
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock()
+
+    mock_resp = MockIntentResponse("en")
+    user_input = MockConversationInput("tắt đèn", "vi")
+
+    with (
+        patch.object(
+            entity,
+            "_async_process_with_runtime",
+            AsyncMock(side_effect=Exception("Database error")),
+        ),
+        patch("homeassistant.helpers.intent.IntentResponse", return_value=mock_resp),
+    ):
+        res = await entity._async_process_request(user_input)
+        assert res.response.error_code is not None
+        assert runtime.diagnostics.last_fallback_reason == FallbackReason.UNEXPECTED_EXCEPTION
+        assert runtime.diagnostics.last_error == "Database error"
+
+
+@pytest.mark.asyncio
+async def test_async_process_with_runtime_flows() -> None:
+    """Test _async_process_with_runtime routing, fallbacks, and validations."""
+    entry = MagicMock()
+    entry.options = {"min_confidence": 0.60, "min_margin": 0.05}
+    entry.entry_id = "test_entry"
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+
+    hass = MagicMock()
+    hass.async_create_task = lambda coro: asyncio.create_task(coro)
+    hass.async_add_executor_job = AsyncMock(
+        side_effect=_executor_job_returning_empty_snapshot_index
+    )
+    entity.hass = hass
+
+    user_input = MockConversationInput("tắt đèn bếp", "vi")
+
+    with patch.object(entity, "_delegate_raw_text", AsyncMock(return_value="raw_delegated")):
+        res = await entity._async_process_with_runtime(user_input)
+        assert res == "raw_delegated"
+        assert runtime.diagnostics.last_fallback_reason == FallbackReason.NO_CANDIDATE
+
+    runtime.indexes["vi"] = MagicMock(candidate_count=5)
+    with (
+        patch.object(
+            STTAssistantRuntime,
+            "rank_with_dynamic_candidates",
+            side_effect=Exception("Rank error"),
+        ),
+        patch.object(entity, "_delegate_raw_text", AsyncMock(return_value="raw_delegated")),
+    ):
+        res = await entity._async_process_with_runtime(user_input)
+        assert res == "raw_delegated"
+        assert runtime.diagnostics.last_fallback_reason == FallbackReason.RANKING_FAILED
+
+    with (
+        patch.object(STTAssistantRuntime, "rank_with_dynamic_candidates", return_value=()),
+        patch.object(entity, "_delegate_raw_text", AsyncMock(return_value="raw_delegated")),
+    ):
+        res = await entity._async_process_with_runtime(user_input)
+        assert res == "raw_delegated"
+        assert runtime.diagnostics.last_fallback_reason == FallbackReason.NO_CANDIDATE
+
+    rc_low_margin_top = RankedCandidate(
+        candidate=Candidate(text="tắt đèn bếp", intent_name="HassTurnOff"),
+        scores=ScoreBreakdown(
+            rapidfuzz_score=0.8,
+            char_ngram_score=0.8,
+            bm25_score=0.8,
+            intent_score=1.0,
+            final_score=0.8,
+        ),
+    )
+    rc_low_margin_competitor = RankedCandidate(
+        candidate=Candidate(text="bật đèn bếp", intent_name="HassTurnOn"),
+        scores=ScoreBreakdown(
+            rapidfuzz_score=0.79,
+            char_ngram_score=0.79,
+            bm25_score=0.79,
+            intent_score=1.0,
+            final_score=0.79,
+        ),
+    )
+    with (
+        patch.object(
+            STTAssistantRuntime,
+            "rank_with_dynamic_candidates",
+            return_value=(rc_low_margin_top, rc_low_margin_competitor),
+        ),
+        patch.object(entity, "_delegate_raw_text", AsyncMock(return_value="raw_delegated")),
+    ):
+        res = await entity._async_process_with_runtime(user_input)
+        assert res == "raw_delegated"
+        assert runtime.diagnostics.last_fallback_reason == FallbackReason.LOW_MARGIN
+
+    rc = RankedCandidate(
+        candidate=Candidate(text="tắt đèn bếp", intent_name="HassTurnOff"),
+        scores=ScoreBreakdown(
+            rapidfuzz_score=0.9,
+            char_ngram_score=0.9,
+            bm25_score=0.9,
+            intent_score=1.0,
+            final_score=0.9,
+        ),
+    )
+    validation_err_res = MagicMock()
+    validation_err_res.response.error_code = "error"
+
+    with (
+        patch.object(STTAssistantRuntime, "rank_with_dynamic_candidates", return_value=(rc,)),
+        patch.object(
+            entity, "_delegate_text", AsyncMock(return_value=validation_err_res)
+        ) as mock_del_text,
+        patch.object(entity, "_delegate_raw_text", AsyncMock(return_value="raw_delegated")),
+    ):
+        res = await entity._async_process_with_runtime(user_input)
+        assert res == "raw_delegated"
+        assert runtime.diagnostics.last_fallback_reason == FallbackReason.VALIDATION_FAILED
+        mock_del_text.assert_any_call("tắt đèn bếp", user_input, primary=True)
+
+    validation_ok_res = MagicMock()
+    validation_ok_res.response.error_code = None
+
+    with (
+        patch.object(STTAssistantRuntime, "rank_with_dynamic_candidates", return_value=(rc,)),
+        patch.object(entity, "_delegate_text", AsyncMock(return_value=validation_ok_res)),
+    ):
+        res = await entity._async_process_with_runtime(user_input)
+        assert res == validation_ok_res
+
+
+@pytest.mark.asyncio
+async def test_empty_static_index_still_uses_dynamic_ranking() -> None:
+    """Try dynamic ranking even when the cached static index has no candidates."""
+    entry = MagicMock()
+    entry.options = {"min_confidence": 0.60, "min_margin": 0.05}
+    entry.entry_id = "test_entry"
+    runtime = STTAssistantRuntime()
+    runtime.indexes["en"] = build_index("en", [])
+    entity = STTAssistantConversationEntity(entry, runtime)
+    hass = MagicMock()
+    hass.async_add_executor_job = AsyncMock(side_effect=lambda target, *args: target(*args))
+    entity.hass = hass
+
+    ranked = RankedCandidate(
+        candidate=Candidate(text="turn on kitchen light", intent_name="HassTurnOn"),
+        scores=ScoreBreakdown(
+            rapidfuzz_score=1.0,
+            char_ngram_score=1.0,
+            bm25_score=1.0,
+            intent_score=1.0,
+            final_score=1.0,
+        ),
+    )
+    validation_ok_res = MagicMock()
+    validation_ok_res.response.error_code = None
+    user_input = MockConversationInput("turn on kitchen light", "en")
+
+    with (
+        patch.object(
+            STTAssistantRuntime,
+            "rank_with_dynamic_candidates",
+            return_value=(ranked,),
+        ) as rank,
+        patch.object(entity, "_delegate_text", AsyncMock(return_value=validation_ok_res)),
+        patch.object(entity, "_delegate_raw_text", AsyncMock(return_value="raw_delegated")) as raw,
+    ):
+        res = await entity._async_process_with_runtime(user_input)
+
+    assert res == validation_ok_res
+    rank.assert_called_once()
+    raw.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_runtime_ranking_receives_satellite_area_context() -> None:
+    """Pass Home Assistant satellite/device area context into lexical ranking."""
+    entry = MagicMock()
+    entry.options = {"min_confidence": 0.60, "min_margin": 0.05}
+    entry.entry_id = "test_entry"
+    runtime = STTAssistantRuntime()
+    runtime.indexes["en"] = MagicMock(candidate_count=1)
+    entity = STTAssistantConversationEntity(entry, runtime)
+    hass = MagicMock()
+    hass.async_add_executor_job = AsyncMock(side_effect=lambda target, *args: target(*args))
+    entity.hass = hass
+
+    user_input = MockConversationInput("mute", "en")
+    user_input.device_id = "device-1"
+    user_input.satellite_id = "media_player.satellite"
+
+    entity_registry = MagicMock()
+    entity_registry.async_get.return_value = SimpleNamespace(
+        area_id="living-room",
+        device_id="satellite-device",
+    )
+    device_registry = MagicMock()
+    device_registry.async_get.return_value = SimpleNamespace(area_id="office")
+    area_registry = MagicMock()
+    area_registry.async_get_area.return_value = SimpleNamespace(name="Living Room")
+
+    ranked = RankedCandidate(
+        candidate=Candidate(text="mute", intent_name="HassMediaPlayerMute"),
+        scores=ScoreBreakdown(
+            rapidfuzz_score=1.0,
+            char_ngram_score=1.0,
+            bm25_score=1.0,
+            intent_score=1.0,
+            final_score=1.0,
+        ),
+    )
+    validation_ok_res = MagicMock()
+    validation_ok_res.response.error_code = None
+
+    with (
+        patch(
+            "custom_components.stt_assistant.conversation.entity_registry.async_get",
+            return_value=entity_registry,
+        ),
+        patch(
+            "custom_components.stt_assistant.conversation.device_registry.async_get",
+            return_value=device_registry,
+        ),
+        patch(
+            "custom_components.stt_assistant.conversation.area_registry.async_get",
+            return_value=area_registry,
+        ),
+        patch.object(
+            STTAssistantRuntime,
+            "rank_with_dynamic_candidates",
+            return_value=(ranked,),
+        ) as rank,
+        patch.object(entity, "_delegate_text", AsyncMock(return_value=validation_ok_res)),
+    ):
+        res = await entity._async_process_with_runtime(user_input)
+
+    assert res is validation_ok_res
+    area_registry.async_get_area.assert_called_once_with("living-room")
+    device_registry.async_get.assert_not_called()
+    assert rank.call_args.kwargs["intent_context"] == {
+        "area": {"value": "Living Room", "text": "Living Room"}
+    }
+
+
+@pytest.mark.asyncio
+async def test_exact_collision_delegates_text_to_hassil_with_original_context() -> None:
+    """Delegate exact same-text collisions to HassIL without executing candidate metadata."""
+    first = Candidate(
+        text="all fan on",
+        intent_name="HassGetState",
+        language="en",
+        metadata={"slots": '{"domain":"fan","state":"on"}'},
+    )
+    second = Candidate(
+        text="all fan on",
+        intent_name="HassTurnOn",
+        language="en",
+        metadata={"slots": '{"domain":"fan"}'},
+    )
+
+    for ordered_candidates in ((first, second), (second, first)):
+        entry = MagicMock()
+        entry.options = {"min_confidence": 0.60, "min_margin": 0.99}
+        entry.entry_id = "test_entry"
+        runtime = STTAssistantRuntime()
+        runtime.indexes["en"] = CanonicalIndex(language="en", candidates=ordered_candidates)
+        entity = STTAssistantConversationEntity(entry, runtime)
+
+        hass = MagicMock()
+        hass.async_add_executor_job = AsyncMock(side_effect=lambda target, *args: target(*args))
+        entity.hass = hass
+        context = Context()
+        user_input = MockConversationInput("all fan on", "en", conversation_id="conv-exact")
+        user_input.context = context
+        user_input.device_id = "device-1"
+        user_input.satellite_id = "assist_satellite.kitchen"
+        user_input.extra_system_prompt = "stay local"
+        hassil_result = MagicMock(name="hassil_result")
+        hassil_result.response.error_code = None
+
+        with (
+            patch.object(
+                entity,
+                "_async_try_assist_pipeline_shortcut",
+                AsyncMock(return_value=None),
+            ),
+            patch(
+                "custom_components.stt_assistant.conversation.conversation.async_converse",
+                AsyncMock(return_value=hassil_result),
+            ) as converse,
+        ):
+            result = await entity._async_process_with_runtime(user_input)
+
+        assert result is hassil_result
+        optional_arguments = {
+            argument: getattr(user_input, argument)
+            for argument in CONVERSATION_INPUT_OPTIONAL_FIELDS
+            if argument in conversation_platform._ASYNC_CONVERSE_PARAMETERS
+        }
+        converse.assert_awaited_once_with(
+            hass,
+            "all fan on",
+            "conv-exact",
+            context,
+            language="en",
+            agent_id=HOME_ASSISTANT_AGENT,
+            device_id="device-1",
+            **optional_arguments,
+        )
+
+
+@pytest.mark.asyncio
+async def test_exact_collision_hassil_rejection_falls_back_to_raw_text() -> None:
+    """Continue through validation failure and raw fallback when HassIL rejects exact text."""
+    entry = MagicMock()
+    entry.options = {"min_confidence": 0.60, "min_margin": 0.99}
+    entry.entry_id = "test_entry"
+    runtime = STTAssistantRuntime()
+    runtime.indexes["en"] = CanonicalIndex(
+        language="en",
+        candidates=(
+            Candidate(text="all fans off", intent_name="HassGetState", language="en"),
+            Candidate(text="all fans off", intent_name="HassTurnOff", language="en"),
+        ),
+    )
+    entity = STTAssistantConversationEntity(entry, runtime)
+    hass = MagicMock()
+    hass.async_add_executor_job = AsyncMock(side_effect=lambda target, *args: target(*args))
+    entity.hass = hass
+    user_input = MockConversationInput("all fans off", "en")
+    validation_error = MagicMock()
+    validation_error.response.error_code = "no_intent_match"
+
+    with (
+        patch.object(
+            entity,
+            "_async_try_assist_pipeline_shortcut",
+            AsyncMock(return_value=None),
+        ),
+        patch.object(
+            entity,
+            "_delegate_text",
+            AsyncMock(side_effect=[validation_error, "raw_result"]),
+        ) as delegate,
+    ):
+        result = await entity._async_process_with_runtime(user_input)
+
+    assert result == "raw_result"
+    assert delegate.await_args_list[0].args == ("all fans off", user_input)
+    assert delegate.await_args_list[0].kwargs == {"primary": True}
+    assert delegate.await_args_list[1].args == ("all fans off", user_input)
+    assert delegate.await_args_list[1].kwargs == {"primary": False}
+    assert runtime.diagnostics.last_fallback_reason == FallbackReason.VALIDATION_FAILED
+
+
+def test_area_from_user_input_falls_back_to_original_device_area() -> None:
+    """Use the request device area when a satellite entity has no area or device."""
+    entry = MagicMock()
+    entry.entry_id = "test_entry"
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock()
+
+    user_input = MockConversationInput("mute", "en")
+    user_input.device_id = "device-1"
+    user_input.satellite_id = "media_player.satellite"
+
+    entity_registry = MagicMock()
+    entity_registry.async_get.return_value = SimpleNamespace(area_id=None, device_id=None)
+    device_registry = MagicMock()
+    device_registry.async_get.return_value = SimpleNamespace(area_id="office")
+    area = SimpleNamespace(name="Office")
+    area_registry = MagicMock()
+    area_registry.async_get_area.return_value = area
+
+    with (
+        patch(
+            "custom_components.stt_assistant.conversation.entity_registry.async_get",
+            return_value=entity_registry,
+        ),
+        patch(
+            "custom_components.stt_assistant.conversation.device_registry.async_get",
+            return_value=device_registry,
+        ),
+        patch(
+            "custom_components.stt_assistant.conversation.area_registry.async_get",
+            return_value=area_registry,
+        ),
+    ):
+        assert entity._area_from_user_input(user_input) is area
+
+    device_registry.async_get.assert_called_once_with("device-1")
+    area_registry.async_get_area.assert_called_once_with("office")
+
+
+@pytest.mark.asyncio
+async def test_validation_only_delegates_accepted_candidate() -> None:
+    """Do not validate lower-ranked candidates that failed confidence gates."""
+    entry = MagicMock()
+    entry.options = {"min_confidence": 0.60, "min_margin": 0.05}
+    entry.entry_id = "test_entry"
+    runtime = STTAssistantRuntime()
+    runtime.indexes["en"] = MagicMock(candidate_count=3)
+    entity = STTAssistantConversationEntity(entry, runtime)
+    hass = MagicMock()
+    hass.async_add_executor_job = AsyncMock(side_effect=lambda target, *args: target(*args))
+    entity.hass = hass
+
+    accepted = RankedCandidate(
+        candidate=Candidate(text="turn on kitchen light", intent_name="HassTurnOn"),
+        scores=ScoreBreakdown(
+            rapidfuzz_score=0.9,
+            char_ngram_score=0.9,
+            bm25_score=0.9,
+            intent_score=1.0,
+            final_score=0.9,
+        ),
+    )
+    rejected = RankedCandidate(
+        candidate=Candidate(text="turn off kitchen light", intent_name="HassTurnOff"),
+        scores=ScoreBreakdown(
+            rapidfuzz_score=0.1,
+            char_ngram_score=0.1,
+            bm25_score=0.1,
+            intent_score=0.1,
+            final_score=0.1,
+        ),
+    )
+    validation_err_res = MagicMock()
+    validation_err_res.response.error_code = intent.IntentResponseErrorCode.NO_INTENT_MATCH
+    validation_ok_res = MagicMock()
+    validation_ok_res.response.error_code = None
+    user_input = MockConversationInput("turn kitchen light", "en")
+
+    with (
+        patch.object(
+            STTAssistantRuntime,
+            "rank_with_dynamic_candidates",
+            return_value=(accepted, rejected),
+        ),
+        patch.object(
+            entity,
+            "_delegate_text",
+            AsyncMock(side_effect=[validation_err_res, validation_ok_res]),
+        ) as mock_del_text,
+        patch.object(entity, "_delegate_raw_text", AsyncMock(return_value="raw_delegated")),
+    ):
+        res = await entity._async_process_with_runtime(user_input)
+
+    assert res == "raw_delegated"
+    mock_del_text.assert_awaited_once_with("turn on kitchen light", user_input, primary=True)
+    assert runtime.diagnostics.last_fallback_reason == FallbackReason.VALIDATION_FAILED
+
+
+@pytest.mark.asyncio
+async def test_validation_tries_remaining_confident_ranked_candidates() -> None:
+    """Re-gate one remaining candidate after HassIL reports no intent match."""
+    entry = MagicMock()
+    entry.options = {"min_confidence": 0.60, "min_margin": 0.05}
+    entry.entry_id = "test_entry"
+    runtime = STTAssistantRuntime()
+    runtime.indexes["en"] = MagicMock(candidate_count=2)
+    entity = STTAssistantConversationEntity(entry, runtime)
+    hass = MagicMock()
+    hass.async_add_executor_job = AsyncMock(side_effect=lambda target, *args: target(*args))
+    entity.hass = hass
+
+    accepted = RankedCandidate(
+        candidate=Candidate(text="turn on kitchen light", intent_name="HassTurnOn"),
+        scores=ScoreBreakdown(
+            rapidfuzz_score=0.9,
+            char_ngram_score=0.9,
+            bm25_score=0.9,
+            intent_score=1.0,
+            final_score=0.9,
+        ),
+    )
+    next_ranked = RankedCandidate(
+        candidate=Candidate(text="turn on kitchen lamp", intent_name="HassTurnOn"),
+        scores=ScoreBreakdown(
+            rapidfuzz_score=0.8,
+            char_ngram_score=0.8,
+            bm25_score=0.8,
+            intent_score=1.0,
+            final_score=0.8,
+        ),
+    )
+    validation_err_res = MagicMock()
+    validation_err_res.response.error_code = intent.IntentResponseErrorCode.NO_INTENT_MATCH
+    validation_ok_res = MagicMock()
+    validation_ok_res.response.error_code = None
+    user_input = MockConversationInput("turn kitchen light", "en")
+
+    with (
+        patch.object(
+            STTAssistantRuntime,
+            "rank_with_dynamic_candidates",
+            return_value=(accepted, next_ranked),
+        ),
+        patch.object(
+            entity,
+            "_delegate_text",
+            AsyncMock(side_effect=[validation_err_res, validation_ok_res]),
+        ) as mock_del_text,
+        patch.object(entity, "_delegate_raw_text", AsyncMock(return_value="raw_delegated")) as raw,
+    ):
+        res = await entity._async_process_with_runtime(user_input)
+
+    assert res == validation_ok_res
+    assert mock_del_text.await_args_list[0].args == ("turn on kitchen light", user_input)
+    assert mock_del_text.await_args_list[0].kwargs == {"primary": True}
+    assert mock_del_text.await_args_list[1].args == ("turn on kitchen lamp", user_input)
+    assert mock_del_text.await_args_list[1].kwargs == {"primary": True}
+    raw.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_no_intent_match_reranks_cross_intent_candidate() -> None:
+    """Recover a lower-ranked intent after the selected text has no HassIL match."""
+    entry = MagicMock()
+    entry.options = {"min_confidence": 0.60, "min_margin": 0.05}
+    entry.entry_id = "test_entry"
+    runtime = STTAssistantRuntime()
+    runtime.indexes["en"] = MagicMock(candidate_count=2)
+    entity = STTAssistantConversationEntity(entry, runtime)
+    hass = MagicMock()
+    hass.async_add_executor_job = AsyncMock(side_effect=lambda target, *args: target(*args))
+    entity.hass = hass
+
+    turn_on = RankedCandidate(
+        candidate=Candidate(text="turn on kitchen light", intent_name="HassTurnOn"),
+        scores=ScoreBreakdown(0.9, 0.9, 0.9, 1.0, 0.9),
+    )
+    turn_off = RankedCandidate(
+        candidate=Candidate(text="turn off kitchen light", intent_name="HassTurnOff"),
+        scores=ScoreBreakdown(0.8, 0.8, 0.8, 1.0, 0.8),
+    )
+    no_match = MagicMock()
+    no_match.response.error_code = intent.IntentResponseErrorCode.NO_INTENT_MATCH
+    success = MagicMock()
+    success.response.error_code = None
+    user_input = MockConversationInput("turn kitchen light", "en")
+
+    with (
+        patch.object(
+            STTAssistantRuntime,
+            "rank_with_dynamic_candidates",
+            return_value=(turn_on, turn_off),
+        ),
+        patch.object(
+            entity,
+            "_delegate_text",
+            AsyncMock(side_effect=[no_match, success]),
+        ) as delegate,
+        patch.object(entity, "_delegate_raw_text", AsyncMock(return_value="raw")) as raw,
+    ):
+        result = await entity._async_process_with_runtime(user_input)
+
+    assert result == success
+    assert [call.args[0] for call in delegate.await_args_list] == [
+        "turn on kitchen light",
+        "turn off kitchen light",
+    ]
+    assert all(call.kwargs == {"primary": True} for call in delegate.await_args_list)
+    raw.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_query_supported_target_replaces_unsupported_higher_rank() -> None:
+    """Execute the query-supported target without trying an unsupported leader."""
+    entry = MagicMock()
+    entry.options = {"min_confidence": 0.60, "min_margin": 0.05}
+    entry.entry_id = "test_entry"
+    runtime = STTAssistantRuntime()
+    runtime.indexes["en"] = MagicMock(candidate_count=3)
+    entity = STTAssistantConversationEntity(entry, runtime)
+    hass = MagicMock()
+    hass.async_add_executor_job = AsyncMock(side_effect=lambda target, *args: target(*args))
+    entity.hass = hass
+
+    selected = RankedCandidate(
+        candidate=Candidate(
+            text="set office light to 20",
+            intent_name="HassLightSet",
+            metadata={"slots": '{"name":"office light","brightness":20}'},
+        ),
+        scores=ScoreBreakdown(0.9, 0.9, 0.9, 1.0, 0.9),
+    )
+    correct_target = RankedCandidate(
+        candidate=Candidate(
+            text="set kitchen light to 50",
+            intent_name="HassLightSet",
+            metadata={"slots": '{"name":"kitchen light","brightness":50}'},
+        ),
+        scores=ScoreBreakdown(0.85, 0.85, 0.85, 1.0, 0.85),
+    )
+    compatible_target = RankedCandidate(
+        candidate=Candidate(
+            text="set living room light to 50",
+            intent_name="HassLightSet",
+            metadata={"slots": '{"name":"living room light","brightness":50}'},
+        ),
+        scores=ScoreBreakdown(0.8, 0.8, 0.8, 1.0, 0.8),
+    )
+    success = MagicMock()
+    success.response.error_code = None
+    user_input = MockConversationInput("set kitchen light to 50", "en")
+
+    with (
+        patch.object(
+            STTAssistantRuntime,
+            "rank_with_dynamic_candidates",
+            return_value=(selected, correct_target, compatible_target),
+        ),
+        patch(
+            "custom_components.stt_assistant.conversation.async_observe_delegated_text",
+            AsyncMock(
+                return_value=RecognitionObservation(
+                    kind=RecognitionKind.INTENT,
+                    intent_name="HassLightSet",
+                )
+            ),
+        ),
+        patch.object(
+            entity,
+            "_delegate_text",
+            AsyncMock(return_value=success),
+        ) as delegate,
+        patch.object(entity, "_delegate_raw_text", AsyncMock(return_value="raw")) as raw,
+    ):
+        result = await entity._async_process_with_runtime(user_input)
+
+    assert result == success
+    assert [call.args[0] for call in delegate.await_args_list] == [
+        "set kitchen light to 50",
+    ]
+    raw.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_no_valid_targets_recovers_after_unmatched_entity_recognition() -> None:
+    """Retry once when re-recognition confirms pre-handler unmatched entities."""
+    entry = MagicMock()
+    entry.options = {"min_confidence": 0.60, "min_margin": 0.05}
+    entry.entry_id = "test_entry"
+    runtime = STTAssistantRuntime()
+    runtime.indexes["en"] = MagicMock(candidate_count=2)
+    entity = STTAssistantConversationEntity(entry, runtime)
+    hass = MagicMock()
+    hass.async_add_executor_job = AsyncMock(side_effect=lambda target, *args: target(*args))
+    entity.hass = hass
+    selected = RankedCandidate(
+        candidate=Candidate(
+            text="set kitchen light to 50",
+            intent_name="HassLightSet",
+            metadata={"slots": '{"name":"kitchen light","brightness":50}'},
+        ),
+        scores=ScoreBreakdown(0.9, 0.9, 0.9, 1.0, 0.9),
+    )
+    alternative = RankedCandidate(
+        candidate=Candidate(
+            text="turn on living room light",
+            intent_name="HassTurnOn",
+            metadata={"slots": '{"name":"living room light"}'},
+        ),
+        scores=ScoreBreakdown(0.8, 0.8, 0.8, 1.0, 0.8),
+    )
+    no_targets = MagicMock()
+    no_targets.response.error_code = intent.IntentResponseErrorCode.NO_VALID_TARGETS
+    success = MagicMock()
+    success.response.error_code = None
+    user_input = MockConversationInput("turn on living room light", "en")
+    observations = iter(
+        (
+            RecognitionObservation(
+                kind=RecognitionKind.INTENT,
+                intent_name="HassLightSet",
+            ),
+            RecognitionObservation(
+                kind=RecognitionKind.UNMATCHED_TARGET,
+                intent_name="HassLightSet",
+                unmatched_entities=("name",),
+            ),
+            RecognitionObservation(
+                kind=RecognitionKind.INTENT,
+                intent_name="HassTurnOn",
+            ),
+        )
+    )
+
+    async def observe(*_args: Any) -> RecognitionObservation:
+        """Return the next recognition observation in the recovery sequence."""
+        return next(observations)
+
+    with (
+        patch.object(
+            STTAssistantRuntime,
+            "rank_with_dynamic_candidates",
+            return_value=(selected, alternative),
+        ),
+        patch.object(
+            entity,
+            "_delegate_text",
+            AsyncMock(side_effect=[no_targets, success]),
+        ) as delegate,
+        patch.object(entity, "_delegate_raw_text", AsyncMock(return_value="raw")) as raw,
+        patch(
+            "custom_components.stt_assistant.conversation.async_observe_delegated_text",
+            side_effect=observe,
+        ) as observe_live,
+    ):
+        result = await entity._async_process_with_runtime(user_input)
+
+    assert result == success
+    assert [call.args[0] for call in delegate.await_args_list] == [
+        "set kitchen light to 50",
+        "turn on living room light",
+    ]
+    raw.assert_not_awaited()
+    assert observe_live.await_count == 3
+    assert user_input.text == "turn on living room light"
+
+
+@pytest.mark.asyncio
+async def test_no_valid_targets_falls_back_after_handler_target_failure() -> None:
+    """Do not retry when re-recognition shows HassIL reached target handling."""
+    entry = MagicMock()
+    entry.options = {"min_confidence": 0.60, "min_margin": 0.05}
+    entry.entry_id = "test_entry"
+    runtime = STTAssistantRuntime()
+    runtime.indexes["en"] = MagicMock(candidate_count=2)
+    entity = STTAssistantConversationEntity(entry, runtime)
+    hass = MagicMock()
+    hass.async_add_executor_job = AsyncMock(side_effect=lambda target, *args: target(*args))
+    entity.hass = hass
+    selected = RankedCandidate(
+        candidate=Candidate(text="turn on kitchen light", intent_name="HassTurnOn"),
+        scores=ScoreBreakdown(0.9, 0.9, 0.9, 1.0, 0.9),
+    )
+    alternative = RankedCandidate(
+        candidate=Candidate(text="turn on living room light", intent_name="HassTurnOn"),
+        scores=ScoreBreakdown(0.8, 0.8, 0.8, 1.0, 0.8),
+    )
+    no_targets = MagicMock()
+    no_targets.response.error_code = intent.IntentResponseErrorCode.NO_VALID_TARGETS
+    user_input = MockConversationInput("turn on the light", "en")
+
+    with (
+        patch.object(
+            STTAssistantRuntime,
+            "rank_with_dynamic_candidates",
+            return_value=(selected, alternative),
+        ),
+        patch.object(entity, "_delegate_text", AsyncMock(return_value=no_targets)) as delegate,
+        patch.object(entity, "_delegate_raw_text", AsyncMock(return_value="raw")) as raw,
+        patch(
+            "custom_components.stt_assistant.conversation.async_observe_delegated_text",
+            AsyncMock(
+                side_effect=(
+                    RecognitionObservation(
+                        kind=RecognitionKind.INTENT,
+                        intent_name="HassTurnOn",
+                    ),
+                    RecognitionObservation(
+                        kind=RecognitionKind.INTENT,
+                        intent_name="HassTurnOn",
+                    ),
+                )
+            ),
+        ) as observe_live,
+    ):
+        result = await entity._async_process_with_runtime(user_input)
+
+    assert result == "raw"
+    delegate.assert_awaited_once_with("turn on kitchen light", user_input, primary=True)
+    assert observe_live.await_count == 2
+    raw.assert_awaited_once_with(user_input)
+
+
+@pytest.mark.asyncio
+async def test_unmatched_entity_provenance_check_fails_closed(
+    conversation_entity: STTAssistantConversationEntity,
+) -> None:
+    """Treat unavailable or failed side-effect-free recognition as indeterminate."""
+    user_input = MockConversationInput("turn on the light", "en")
+
+    for observation in (
+        RecognitionObservation(kind=RecognitionKind.ERROR, error_category="agent_unavailable"),
+        RecognitionObservation(kind=RecognitionKind.ERROR, error_category="recognition_failed"),
+        RecognitionObservation(kind=RecognitionKind.NO_MATCH),
+    ):
+        with patch(
+            "custom_components.stt_assistant.conversation.async_observe_delegated_text",
+            AsyncMock(return_value=observation),
+        ):
+            assert not await conversation_entity._async_has_unmatched_entities(
+                "turn on kitchen light", user_input
+            )
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        intent.IntentResponseErrorCode.FAILED_TO_HANDLE,
+        intent.IntentResponseErrorCode.UNKNOWN,
+        "future_error_code",
+    ],
+)
+@pytest.mark.asyncio
+async def test_nonretryable_hassil_errors_do_not_execute_another_candidate(
+    error_code: object,
+) -> None:
+    """Do not retry after errors that may follow handler side effects."""
+    entry = MagicMock()
+    entry.options = {"min_confidence": 0.60, "min_margin": 0.05}
+    entry.entry_id = "test_entry"
+    runtime = STTAssistantRuntime()
+    runtime.indexes["en"] = MagicMock(candidate_count=2)
+    entity = STTAssistantConversationEntity(entry, runtime)
+    hass = MagicMock()
+    hass.async_add_executor_job = AsyncMock(side_effect=lambda target, *args: target(*args))
+    entity.hass = hass
+    selected = RankedCandidate(
+        candidate=Candidate(text="turn on kitchen light", intent_name="HassTurnOn"),
+        scores=ScoreBreakdown(0.9, 0.9, 0.9, 1.0, 0.9),
+    )
+    remaining = RankedCandidate(
+        candidate=Candidate(text="turn on kitchen lamp", intent_name="HassTurnOn"),
+        scores=ScoreBreakdown(0.8, 0.8, 0.8, 1.0, 0.8),
+    )
+    failed = MagicMock()
+    failed.response.error_code = error_code
+    user_input = MockConversationInput("turn kitchen light", "en")
+
+    with (
+        patch.object(
+            STTAssistantRuntime,
+            "rank_with_dynamic_candidates",
+            return_value=(selected, remaining),
+        ),
+        patch.object(entity, "_delegate_text", AsyncMock(return_value=failed)) as delegate,
+        patch.object(entity, "_delegate_raw_text", AsyncMock(return_value="raw")) as raw,
+    ):
+        result = await entity._async_process_with_runtime(user_input)
+
+    assert result == "raw"
+    delegate.assert_awaited_once_with("turn on kitchen light", user_input, primary=True)
+    raw.assert_awaited_once_with(user_input)
+
+
+@pytest.mark.asyncio
+async def test_candidate_recovery_is_capped_at_one_additional_hassil_call() -> None:
+    """Fall back after two failed primary executions without trying a third candidate."""
+    entry = MagicMock()
+    entry.options = {"min_confidence": 0.60, "min_margin": 0.05}
+    entry.entry_id = "test_entry"
+    runtime = STTAssistantRuntime()
+    runtime.indexes["en"] = MagicMock(candidate_count=3)
+    entity = STTAssistantConversationEntity(entry, runtime)
+    hass = MagicMock()
+    hass.async_add_executor_job = AsyncMock(side_effect=lambda target, *args: target(*args))
+    entity.hass = hass
+    ranked = tuple(
+        RankedCandidate(
+            candidate=Candidate(text=text, intent_name="HassTurnOn"),
+            scores=ScoreBreakdown(score, score, score, 1.0, score),
+        )
+        for text, score in (
+            ("turn on kitchen light", 0.9),
+            ("turn on kitchen lamp", 0.8),
+            ("switch on kitchen light", 0.7),
+        )
+    )
+    no_match = MagicMock()
+    no_match.response.error_code = intent.IntentResponseErrorCode.NO_INTENT_MATCH
+    user_input = MockConversationInput("turn kitchen light", "en")
+
+    with (
+        patch.object(
+            STTAssistantRuntime,
+            "rank_with_dynamic_candidates",
+            return_value=ranked,
+        ),
+        patch.object(
+            entity,
+            "_delegate_text",
+            AsyncMock(side_effect=[no_match, no_match]),
+        ) as delegate,
+        patch.object(entity, "_delegate_raw_text", AsyncMock(return_value="raw")) as raw,
+    ):
+        result = await entity._async_process_with_runtime(user_input)
+
+    assert result == "raw"
+    assert [call.args[0] for call in delegate.await_args_list] == [
+        "turn on kitchen light",
+        "turn on kitchen lamp",
+    ]
+    raw.assert_awaited_once_with(user_input)
+
+
+@pytest.mark.asyncio
+async def test_recovery_handler_error_routes_to_fallback_agent() -> None:
+    """Route the original query to the fallback agent after recovery fails."""
+    entry = MagicMock(entry_id="test_entry")
+    entry.options = {
+        "min_confidence": 0.60,
+        "min_margin": 0.05,
+        ConfigKey.FALLBACK_AGENT_ID: "llm_agent",
+    }
+    runtime = STTAssistantRuntime()
+    runtime.indexes["en"] = MagicMock(candidate_count=2)
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock(
+        async_add_executor_job=AsyncMock(side_effect=lambda target, *args: target(*args))
+    )
+    ranked = (
+        RankedCandidate(
+            Candidate(text="turn on kitchen light", intent_name="HassTurnOn"),
+            ScoreBreakdown(0.9, 0.9, 0.9, 1.0, 0.9),
+        ),
+        RankedCandidate(
+            Candidate(text="turn on kitchen lamp", intent_name="HassTurnOn"),
+            ScoreBreakdown(0.8, 0.8, 0.8, 1.0, 0.8),
+        ),
+    )
+    no_match = MagicMock()
+    no_match.response.error_code = intent.IntentResponseErrorCode.NO_INTENT_MATCH
+    failed = MagicMock()
+    failed.response.error_code = intent.IntentResponseErrorCode.FAILED_TO_HANDLE
+    fallback_result = MagicMock()
+    fallback_result.response.error_code = None
+    user_input = MockConversationInput("turn kitchen light", "en")
+
+    with (
+        patch.object(STTAssistantRuntime, "rank_with_dynamic_candidates", return_value=ranked),
+        patch(
+            "homeassistant.components.conversation.async_converse",
+            AsyncMock(side_effect=[no_match, failed, fallback_result]),
+        ) as converse,
+    ):
+        result = await entity._async_process_with_runtime(user_input)
+
+    assert result is fallback_result
+    assert [call.args[1] for call in converse.await_args_list] == [
+        "turn on kitchen light",
+        "turn on kitchen lamp",
+        user_input.text,
+    ]
+    assert [call.kwargs[ConversationInputField.AGENT_ID] for call in converse.await_args_list] == [
+        HOME_ASSISTANT_AGENT,
+        HOME_ASSISTANT_AGENT,
+        "llm_agent",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_candidate_recovery_skips_normalized_duplicate_text(
+    conversation_entity: STTAssistantConversationEntity,
+) -> None:
+    """Do not send the same delegated command twice during recovery."""
+    selected = RankedCandidate(
+        candidate=Candidate(text="Turn on kitchen light!", intent_name="HassTurnOn"),
+        scores=ScoreBreakdown(0.9, 0.9, 0.9, 1.0, 0.9),
+    )
+    duplicate = RankedCandidate(
+        candidate=Candidate(text="turn on kitchen light", intent_name="HassTurnOn"),
+        scores=ScoreBreakdown(0.85, 0.85, 0.85, 1.0, 0.85),
+    )
+    distinct = RankedCandidate(
+        candidate=Candidate(text="switch on kitchen light", intent_name="HassTurnOn"),
+        scores=ScoreBreakdown(0.8, 0.8, 0.8, 1.0, 0.8),
+    )
+    user_input = MockConversationInput("turn kitchen light", "en")
+
+    recovery = await conversation_entity._async_ranked_recovery_candidate(
+        (selected, duplicate, distinct),
+        selected,
+        "Turn on kitchen light!",
+        intent.IntentResponseErrorCode.NO_INTENT_MATCH.value,
+        0.60,
+        0.05,
+        user_input,
+    )
+
+    assert recovery is not None
+    assert recovery[0] is distinct
+    assert recovery[1] == "switch on kitchen light"
+
+
+@pytest.mark.asyncio
+async def test_live_preflight_skips_duplicate_text_and_allows_metadata_divergence() -> None:
+    """Execute a lower distinct text when live recognition rejects the lexical winner."""
+    entry = MagicMock(entry_id="test_entry")
+    entry.options = {"min_confidence": 0.60, "min_margin": 0.05}
+    runtime = STTAssistantRuntime()
+    runtime.indexes["en"] = MagicMock(candidate_count=3)
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock(
+        async_add_executor_job=AsyncMock(side_effect=lambda target, *args: target(*args))
+    )
+    top = RankedCandidate(
+        Candidate(text="turn on ghost lamp", intent_name="IntentGeneratedTop"),
+        ScoreBreakdown(0.90, 0.90, 0.90, 0.90, 0.90),
+    )
+    duplicate = RankedCandidate(
+        Candidate(text="Turn on ghost lamp!", intent_name="IntentDuplicateMetadata"),
+        ScoreBreakdown(0.85, 0.85, 0.85, 0.85, 0.85),
+    )
+    lower = RankedCandidate(
+        Candidate(
+            text="turn on living room lamp",
+            intent_name="IntentGeneratedLower",
+            metadata={"slots": '{"name":"generated name"}'},
+        ),
+        ScoreBreakdown(0.80, 0.80, 0.80, 0.80, 0.80),
+    )
+    observations = (
+        RecognitionObservation(kind=RecognitionKind.NO_MATCH),
+        RecognitionObservation(
+            kind=RecognitionKind.INTENT,
+            intent_name="HassTurnOn",
+            slots=(("name", "Living Room Lamp"),),
+        ),
+    )
+    success = MagicMock()
+    success.response.error_code = None
+    user_input = MockConversationInput("turn teh lamp on", "en")
+
+    with (
+        patch.object(
+            STTAssistantRuntime,
+            "rank_with_dynamic_candidates",
+            return_value=(top, duplicate, lower),
+        ),
+        patch(
+            "custom_components.stt_assistant.conversation.async_observe_delegated_text",
+            AsyncMock(side_effect=observations),
+        ) as observe,
+        patch.object(entity, "_delegate_text", AsyncMock(return_value=success)) as delegate,
+        patch.object(entity, "_delegate_raw_text", AsyncMock(return_value="raw")) as raw,
+    ):
+        result = await entity._async_process_with_runtime(user_input)
+
+    assert result is success
+    assert [call.args[2] for call in observe.await_args_list] == [
+        "turn on ghost lamp",
+        "turn on living room lamp",
+    ]
+    delegate.assert_awaited_once_with("turn on living room lamp", user_input, primary=True)
+    raw.assert_not_awaited()
+    assert runtime.diagnostics.preflight_attempt_count == 2
+    assert runtime.diagnostics.metadata_diverged
+    assert runtime.diagnostics.metadata_divergence_reason == "intent_and_slots"
+    assert runtime.diagnostics.recognition_intent == "HassTurnOn"
+
+
+@pytest.mark.asyncio
+async def test_live_preflight_prefers_same_intent_surface_with_aligned_recognition() -> None:
+    """Prefer an alternate wording when it preserves and validates the ranked intent."""
+    entry = MagicMock(entry_id="test_entry")
+    entry.options = {"min_confidence": 0.60, "min_margin": 0.05}
+    runtime = STTAssistantRuntime()
+    runtime.indexes["en"] = MagicMock(candidate_count=3)
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock(
+        async_add_executor_job=AsyncMock(side_effect=lambda target, *args: target(*args))
+    )
+    ambiguous_surface = RankedCandidate(
+        Candidate(text="bedroom light on", intent_name="HassTurnOn"),
+        ScoreBreakdown(0.90, 0.90, 0.90, 0.90, 0.90),
+    )
+    unrelated_intent = RankedCandidate(
+        Candidate(text="turn off bedroom light", intent_name="HassTurnOff"),
+        ScoreBreakdown(0.84, 0.84, 0.84, 0.84, 0.84),
+    )
+    explicit_surface = RankedCandidate(
+        Candidate(text="turn on bedroom light", intent_name="HassTurnOn"),
+        ScoreBreakdown(0.82, 0.82, 0.82, 0.82, 0.82),
+    )
+    observations = (
+        RecognitionObservation(
+            kind=RecognitionKind.INTENT,
+            intent_name="HassLightSet",
+        ),
+        RecognitionObservation(
+            kind=RecognitionKind.INTENT,
+            intent_name="HassTurnOn",
+        ),
+    )
+    success = MagicMock()
+    success.response.error_code = None
+    user_input = MockConversationInput("turn bedrom light", "en")
+
+    with (
+        patch.object(
+            STTAssistantRuntime,
+            "rank_with_dynamic_candidates",
+            return_value=(ambiguous_surface, unrelated_intent, explicit_surface),
+        ),
+        patch(
+            "custom_components.stt_assistant.conversation.async_observe_delegated_text",
+            AsyncMock(side_effect=observations),
+        ) as observe,
+        patch.object(entity, "_delegate_text", AsyncMock(return_value=success)) as delegate,
+        patch.object(entity, "_delegate_raw_text", AsyncMock(return_value="raw")) as raw,
+    ):
+        result = await entity._async_process_with_runtime(user_input)
+
+    assert result is success
+    assert [call.args[2] for call in observe.await_args_list] == [
+        "bedroom light on",
+        "turn on bedroom light",
+    ]
+    delegate.assert_awaited_once_with("turn on bedroom light", user_input, primary=True)
+    raw.assert_not_awaited()
+    assert runtime.diagnostics.preflight_attempt_count == 2
+    assert not runtime.diagnostics.metadata_diverged
+    assert runtime.diagnostics.recognition_intent == "HassTurnOn"
+
+
+@pytest.mark.asyncio
+async def test_live_preflight_stops_after_three_distinct_texts() -> None:
+    """Fail closed after the configured three-text recognition budget."""
+    entry = MagicMock(entry_id="test_entry")
+    entry.options = {"min_confidence": 0.60, "min_margin": 0.05}
+    runtime = STTAssistantRuntime()
+    runtime.indexes["en"] = MagicMock(candidate_count=4)
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock(
+        async_add_executor_job=AsyncMock(side_effect=lambda target, *args: target(*args))
+    )
+    ranked = tuple(
+        RankedCandidate(
+            Candidate(text=f"command {index}", intent_name="IntentSame"),
+            ScoreBreakdown(score, score, score, score, score),
+        )
+        for index, score in enumerate((0.90, 0.85, 0.80, 0.75), start=1)
+    )
+    user_input = MockConversationInput("raw original", "en")
+
+    with (
+        patch.object(
+            STTAssistantRuntime,
+            "rank_with_dynamic_candidates",
+            return_value=ranked,
+        ),
+        patch(
+            "custom_components.stt_assistant.conversation.async_observe_delegated_text",
+            AsyncMock(return_value=RecognitionObservation(kind=RecognitionKind.NO_MATCH)),
+        ) as observe,
+        patch.object(entity, "_delegate_text", AsyncMock()) as delegate,
+        patch.object(entity, "_delegate_raw_text", AsyncMock(return_value="raw")) as raw,
+    ):
+        result = await entity._async_process_with_runtime(user_input)
+
+    assert result == "raw"
+    assert observe.await_count == 3
+    delegate.assert_not_awaited()
+    raw.assert_awaited_once_with(user_input)
+    assert runtime.diagnostics.preflight_attempt_count == 3
+
+
+@pytest.mark.asyncio
+async def test_live_preflight_sentence_trigger_uses_raw_fallback() -> None:
+    """Never execute a fuzzy rewrite that newly matches a sentence trigger."""
+    entry = MagicMock(entry_id="test_entry")
+    entry.options = {"min_confidence": 0.60, "min_margin": 0.05}
+    runtime = STTAssistantRuntime()
+    runtime.indexes["en"] = MagicMock(candidate_count=1)
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock(
+        async_add_executor_job=AsyncMock(side_effect=lambda target, *args: target(*args))
+    )
+    ranked = (
+        RankedCandidate(
+            Candidate(text="start bedtime", intent_name="GeneratedIntent"),
+            ScoreBreakdown(0.90, 0.90, 0.90, 0.90, 0.90),
+        ),
+    )
+    user_input = MockConversationInput("stert bedtime", "en")
+
+    with (
+        patch.object(
+            STTAssistantRuntime,
+            "rank_with_dynamic_candidates",
+            return_value=ranked,
+        ),
+        patch(
+            "custom_components.stt_assistant.conversation.async_observe_delegated_text",
+            AsyncMock(return_value=RecognitionObservation(kind=RecognitionKind.SENTENCE_TRIGGER)),
+        ),
+        patch.object(entity, "_delegate_text", AsyncMock()) as delegate,
+        patch.object(entity, "_delegate_raw_text", AsyncMock(return_value="raw")) as raw,
+    ):
+        result = await entity._async_process_with_runtime(user_input)
+
+    assert result == "raw"
+    delegate.assert_not_awaited()
+    raw.assert_awaited_once_with(user_input)
+    assert runtime.diagnostics.recognition_kind == "sentence_trigger"
+
+
+@pytest.mark.asyncio
+async def test_candidate_recovery_reapplies_margin_gate(
+    conversation_entity: STTAssistantConversationEntity,
+) -> None:
+    """Reject recovery when the remaining top intents are still ambiguous."""
+    selected = RankedCandidate(
+        candidate=Candidate(text="first command", intent_name="IntentA"),
+        scores=ScoreBreakdown(0.9, 0.9, 0.9, 1.0, 0.9),
+    )
+    remaining = RankedCandidate(
+        candidate=Candidate(text="second command", intent_name="IntentB"),
+        scores=ScoreBreakdown(0.8, 0.8, 0.8, 1.0, 0.8),
+    )
+    competitor = RankedCandidate(
+        candidate=Candidate(text="third command", intent_name="IntentC"),
+        scores=ScoreBreakdown(0.78, 0.78, 0.78, 1.0, 0.78),
+    )
+
+    recovery = await conversation_entity._async_ranked_recovery_candidate(
+        (selected, remaining, competitor),
+        selected,
+        "first command",
+        intent.IntentResponseErrorCode.NO_INTENT_MATCH.value,
+        0.60,
+        0.05,
+        MockConversationInput("ambiguous command", "en"),
+    )
+
+    assert recovery is None
+
+
+@pytest.mark.asyncio
+async def test_validation_delegate_exception_does_not_retry_candidates() -> None:
+    """Do not execute another candidate after an indeterminate delegate exception."""
+    entry = MagicMock()
+    entry.options = {"min_confidence": 0.60, "min_margin": 0.05}
+    entry.entry_id = "test_entry"
+    runtime = STTAssistantRuntime()
+    runtime.indexes["en"] = MagicMock(candidate_count=2)
+    entity = STTAssistantConversationEntity(entry, runtime)
+    hass = MagicMock()
+    hass.async_add_executor_job = AsyncMock(side_effect=lambda target, *args: target(*args))
+    entity.hass = hass
+
+    accepted = RankedCandidate(
+        candidate=Candidate(text="turn on kitchen light", intent_name="HassTurnOn"),
+        scores=ScoreBreakdown(
+            rapidfuzz_score=0.9,
+            char_ngram_score=0.9,
+            bm25_score=0.9,
+            intent_score=1.0,
+            final_score=0.9,
+        ),
+    )
+    next_ranked = RankedCandidate(
+        candidate=Candidate(text="turn on kitchen lamp", intent_name="HassTurnOn"),
+        scores=ScoreBreakdown(
+            rapidfuzz_score=0.8,
+            char_ngram_score=0.8,
+            bm25_score=0.8,
+            intent_score=1.0,
+            final_score=0.8,
+        ),
+    )
+    user_input = MockConversationInput("turn kitchen light", "en")
+
+    with (
+        patch.object(
+            STTAssistantRuntime,
+            "rank_with_dynamic_candidates",
+            return_value=(accepted, next_ranked),
+        ),
+        patch.object(
+            entity,
+            "_delegate_text",
+            AsyncMock(side_effect=RuntimeError("primary failed")),
+        ) as mock_del_text,
+        patch.object(entity, "_delegate_raw_text", AsyncMock(return_value="raw_delegated")) as raw,
+    ):
+        res = await entity._async_process_with_runtime(user_input)
+
+    assert res == "raw_delegated"
+    assert mock_del_text.await_args_list[0].args == ("turn on kitchen light", user_input)
+    assert mock_del_text.await_args_list[0].kwargs == {"primary": True}
+    assert len(mock_del_text.await_args_list) == 1
+    raw.assert_awaited_once_with(user_input)
+    assert runtime.diagnostics.last_error == "primary failed"
+
+
+@pytest.mark.asyncio
+async def test_validation_delegate_exception_fallback_keeps_error() -> None:
+    """Keep a candidate execution exception when falling back without retrying."""
+    entry = MagicMock()
+    entry.options = {"min_confidence": 0.60, "min_margin": 0.05}
+    entry.entry_id = "test_entry"
+    runtime = STTAssistantRuntime()
+    runtime.indexes["en"] = MagicMock(candidate_count=2)
+    entity = STTAssistantConversationEntity(entry, runtime)
+    hass = MagicMock()
+    hass.async_add_executor_job = AsyncMock(side_effect=lambda target, *args: target(*args))
+    entity.hass = hass
+
+    accepted = RankedCandidate(
+        candidate=Candidate(text="turn on kitchen light", intent_name="HassTurnOn"),
+        scores=ScoreBreakdown(
+            rapidfuzz_score=0.9,
+            char_ngram_score=0.9,
+            bm25_score=0.9,
+            intent_score=1.0,
+            final_score=0.9,
+        ),
+    )
+    next_ranked = RankedCandidate(
+        candidate=Candidate(text="turn on kitchen lamp", intent_name="HassTurnOn"),
+        scores=ScoreBreakdown(
+            rapidfuzz_score=0.8,
+            char_ngram_score=0.8,
+            bm25_score=0.8,
+            intent_score=1.0,
+            final_score=0.8,
+        ),
+    )
+    user_input = MockConversationInput("turn kitchen light", "en")
+
+    with (
+        patch.object(
+            STTAssistantRuntime,
+            "rank_with_dynamic_candidates",
+            return_value=(accepted, next_ranked),
+        ),
+        patch.object(
+            entity,
+            "_delegate_text",
+            AsyncMock(side_effect=RuntimeError("primary failed")),
+        ) as mock_del_text,
+        patch.object(entity, "_delegate_raw_text", AsyncMock(return_value="raw_delegated")) as raw,
+    ):
+        res = await entity._async_process_with_runtime(user_input)
+
+    assert res == "raw_delegated"
+    assert mock_del_text.await_args_list[0].args == ("turn on kitchen light", user_input)
+    assert mock_del_text.await_args_list[0].kwargs == {"primary": True}
+    assert len(mock_del_text.await_args_list) == 1
+    raw.assert_awaited_once_with(user_input)
+    assert runtime.diagnostics.last_fallback_reason == FallbackReason.VALIDATION_FAILED
+    assert runtime.diagnostics.last_error == "primary failed"
+
+
+@pytest.mark.asyncio
+async def test_conversation_resolves_updated_options_without_reload() -> None:
+    """Resolve every current option from the live config entry for each request."""
+    entry = MagicMock()
+    entry.entry_id = "this_agent"
+    entry.data = {}
+    entry.options = {
+        ConfigKey.FALLBACK_AGENT_ID: "first_agent",
+        ConfigKey.MIN_CONFIDENCE: 0.60,
+        ConfigKey.MIN_MARGIN: 0.05,
+    }
+    entity = STTAssistantConversationEntity(entry, STTAssistantRuntime())
+    user_input = MockConversationInput("turn on the light", "en")
+    decision = MagicMock()
+
+    with patch.object(
+        entity,
+        "_async_rank_user_input",
+        AsyncMock(return_value=((), decision)),
+    ) as rank:
+        first_request = await entity._async_rank_request(user_input, "en", MagicMock())
+        assert entity._fallback_agent_id("default") == "first_agent"
+
+        entry.options = {
+            ConfigKey.FALLBACK_AGENT_ID: "second_agent",
+            ConfigKey.MIN_CONFIDENCE: 0.80,
+            ConfigKey.MIN_MARGIN: 0.10,
+        }
+        second_request = await entity._async_rank_request(user_input, "en", MagicMock())
+
+    assert first_request is not None
+    assert (first_request.min_confidence, first_request.min_margin) == (0.60, 0.05)
+    assert second_request is not None
+    assert (second_request.min_confidence, second_request.min_margin) == (0.80, 0.10)
+    assert entity._fallback_agent_id("default") == "second_agent"
+    assert [(call.args[-2], call.args[-1]) for call in rank.await_args_list] == [
+        (0.60, 0.05),
+        (0.80, 0.10),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_conversation_delegate_and_fallback_agent_logic() -> None:
+    """Test delegation and fallback agent ID selection branch options."""
+    entry = MagicMock()
+    entry.entry_id = "this_agent"
+    entry.options = cast(
+        dict[str, Any], {ConfigKey.MIN_CONFIDENCE: 0.60, ConfigKey.MIN_MARGIN: 0.05}
+    )
+    entry.data = {}
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+    hass = MagicMock()
+
+    hass.async_add_executor_job = AsyncMock(side_effect=_executor_job_returning_empty_build_index)
+    entity.hass = hass
+
+    user_input = MockConversationInput("tắt đèn bếp", "vi")
+
+    # 1. Test fallback_agent_id with options
+    entry.options[ConfigKey.FALLBACK_AGENT_ID] = "options_agent"
+    assert entity._fallback_agent_id("default") == "options_agent"
+
+    # 2. Test fallback_agent_id with options matching entry_id (self-forwarding prevention)
+    entry.options[ConfigKey.FALLBACK_AGENT_ID] = "this_agent"
+    assert entity._fallback_agent_id("default") == "default"
+
+    # 3. Test fallback_agent_id with invalid type
+    entry.options[ConfigKey.FALLBACK_AGENT_ID] = 123
+    assert entity._fallback_agent_id("default") == "default"
+
+    # 4. Test fallback_agent_id fallback to data
+    entry.options = {}
+    entry.data[ConfigKey.FALLBACK_AGENT_ID] = "data_agent"
+    assert entity._fallback_agent_id("default") == "data_agent"
+
+    # 5. Test actual delegate_raw_text calls conversation.async_converse
+    entry.options = {ConfigKey.FALLBACK_AGENT_ID: "options_agent"}
+    mock_result = MagicMock()
+    with patch(
+        "homeassistant.components.conversation.async_converse", AsyncMock(return_value=mock_result)
+    ) as mock_converse:
+        res = await entity._delegate_raw_text(user_input)
+        assert res is mock_result
+        optional_arguments = {
+            argument: getattr(user_input, argument, None)
+            for argument in CONVERSATION_INPUT_OPTIONAL_FIELDS
+            if argument in conversation_platform._ASYNC_CONVERSE_PARAMETERS
+        }
+        mock_converse.assert_called_once_with(
+            entity.hass,
+            "tắt đèn bếp",
+            user_input.conversation_id,
+            user_input.context,
+            language=user_input.language,
+            agent_id="options_agent",
+            device_id=user_input.device_id,
+            **optional_arguments,
+        )
+
+    # 6. Test async_process success path executes and updates diagnostics
+    runtime.indexes["vi"] = MagicMock(candidate_count=5)
+    rc = RankedCandidate(
+        candidate=Candidate(text="tắt đèn bếp", intent_name="HassTurnOff"),
+        scores=ScoreBreakdown(
+            rapidfuzz_score=0.9,
+            char_ngram_score=0.9,
+            bm25_score=0.9,
+            intent_score=1.0,
+            final_score=0.9,
+        ),
+    )
+    validation_ok_res = MagicMock()
+    validation_ok_res.response.error_code = None
+
+    with (
+        patch.object(STTAssistantRuntime, "rank_with_dynamic_candidates", return_value=(rc,)),
+        patch.object(entity, "_delegate_text", AsyncMock(return_value=validation_ok_res)),
+    ):
+        res = await entity._async_process_request(user_input)
+        assert res is validation_ok_res
+        assert runtime.diagnostics.last_fallback_reason is None
+
+    # 7. Test async_prepare empty/None language branch
+    await entity.async_prepare(None)
+
+
+@pytest.mark.parametrize(
+    ("prefer_local_intents", "uses_shortcut"),
+    [(False, True), (True, False)],
+    ids=["disabled-uses-shortcut", "enabled-skips-shortcut"],
+)
+@pytest.mark.asyncio
+async def test_assist_pipeline_shortcut_respects_prefer_local_intents(
+    monkeypatch: pytest.MonkeyPatch,
+    prefer_local_intents: bool,
+    uses_shortcut: bool,
+) -> None:
+    """Use the HassIL shortcut only when Home Assistant has not already done so."""
+    _mock_assist_pipeline_const(monkeypatch)
+
+    entry = MagicMock(entry_id="test-entry")
+    entry.options = {}
+    entry.data = {}
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock()
+    user_input = MockConversationInput("tắt đèn bếp", "vi")
+    entity.hass.data = {
+        "assist_pipeline": _active_pipeline_data(
+            user_input.context,
+            SimpleNamespace(prefer_local_intents=prefer_local_intents),
+        )
+    }
+    shortcut_result = MagicMock()
+
+    with patch.object(
+        entity,
+        "_delegate_with_capture",
+        AsyncMock(return_value=shortcut_result),
+    ) as mock_shortcut:
+        result = await entity._async_try_assist_pipeline_shortcut(user_input)
+
+    if uses_shortcut:
+        assert result is shortcut_result
+        mock_shortcut.assert_awaited_once_with(user_input.text, user_input, None, None)
+    else:
+        assert result is None
+        mock_shortcut.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "simulate_exception",
+    [False, True],
+)
+@pytest.mark.asyncio
+async def test_async_process_shortcut_restores_chat_log(
+    monkeypatch: pytest.MonkeyPatch,
+    simulate_exception: bool,
+) -> None:
+    """Test that the chat log is restored if the shortcut path fails or raises an exception."""
+    _mock_assist_pipeline_const(monkeypatch)
+
+    class DummyPipeline:
+        """Dummy pipeline class for testing."""
+
+        prefer_local_intents = False
+
+    entry = MagicMock(entry_id="test-entry")
+    entry.options = {}
+    entry.data = {}
+    runtime = STTAssistantRuntime()
+    mock_index = MagicMock()
+    mock_index.language = "vi"
+    runtime.set_index(mock_index)
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock()
+
+    mock_user_message = MagicMock()
+    mock_user_message.role = "user"
+    mock_user_message.content = "tắt đèn bếp"
+
+    mock_chat_log = MagicMock()
+    mock_chat_log.content = [mock_user_message]
+
+    entity.hass.async_add_executor_job = AsyncMock(side_effect=lambda target, *args: target(*args))
+
+    user_input = MockConversationInput("tắt đèn bếp", "vi", conversation_id="conv-1")
+    entity.hass.data = {
+        "assist_pipeline": _active_pipeline_data(user_input.context, DummyPipeline())
+    }
+
+    # Shortcut result has an error
+    shortcut_res = MagicMock()
+    shortcut_res.response.error_code = "intent-failed"
+
+    # Fallback validation succeeds
+    validation_ok_res = MagicMock()
+    validation_ok_res.response.error_code = None
+
+    with (
+        patch.object(
+            entity,
+            "_get_active_chat_log",
+            return_value=mock_chat_log,
+        ),
+        patch.object(
+            entity,
+            "_delegate_text",
+            AsyncMock(),
+        ) as mock_delegate,
+        patch.object(
+            STTAssistantRuntime,
+            "rank_with_dynamic_candidates",
+            return_value=[
+                RankedCandidate(
+                    candidate=Candidate(
+                        text="tắt đèn bếp",
+                        intent_name="HassTurnOff",
+                        slot_values=(),
+                        language="vi",
+                    ),
+                    scores=ScoreBreakdown(1.0, 1.0, 1.0, 1.0, 1.0),
+                )
+            ],
+        ),
+    ):
+        call_count = 0
+
+        def side_effect(*args, **kwargs):
+            """Side effect helper to simulate shortcut failure followed by success."""
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                mock_chat_log.content.append(MagicMock(role="assistant", content="error response"))
+                if simulate_exception:
+                    raise RuntimeError("Shortcut failed")
+                return shortcut_res
+            return validation_ok_res
+
+        mock_delegate.side_effect = side_effect
+
+        res = await entity._async_process_request(user_input)
+        assert res is validation_ok_res
+
+        # Verify that mock_chat_log.content was restored to the original snapshot
+        assert mock_chat_log.content == [mock_user_message]
+
+
+@pytest.mark.parametrize(
+    "simulate_exception",
+    [False, True],
+)
+@pytest.mark.asyncio
+async def test_async_execute_ranked_candidate_restores_chat_log(
+    simulate_exception: bool,
+) -> None:
+    """Restore the chat log when candidate execution fails or raises an exception."""
+    entry = MagicMock()
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock()
+
+    # Create mock chat log
+    mock_user_message = MagicMock()
+    mock_user_message.role = "user"
+    mock_user_message.content = "original query"
+
+    mock_chat_log = MagicMock()
+    mock_chat_log.content = [mock_user_message]
+
+    user_input = MockConversationInput("original query", "vi", conversation_id="conv-1")
+
+    ranked_candidate = RankedCandidate(
+        candidate=Candidate(
+            text="tắt đèn bếp",
+            intent_name="HassTurnOff",
+            slot_values=(),
+            language="vi",
+        ),
+        scores=ScoreBreakdown(1.0, 1.0, 1.0, 1.0, 1.0),
+    )
+
+    # Validation result has an error
+    validation_res = MagicMock()
+    validation_res.response.error_code = "intent-failed"
+
+    with (
+        patch.object(
+            entity,
+            "_get_active_chat_log",
+            return_value=mock_chat_log,
+        ),
+        patch.object(
+            entity,
+            "_delegate_text",
+            AsyncMock(),
+        ) as mock_delegate,
+    ):
+
+        def side_effect(*args, **kwargs):
+            """Side effect helper to simulate validation outcome."""
+            # During _delegate_text execution, a user message and
+            # assistant message get appended to the chat log
+            mock_chat_log.content.extend(
+                [
+                    MagicMock(role="user", content="tắt đèn bếp"),
+                    MagicMock(role="assistant", content="error response"),
+                ]
+            )
+            if simulate_exception:
+                raise RuntimeError("Validation exception")
+            return validation_res
+
+        mock_delegate.side_effect = side_effect
+
+        res = await entity._async_execute_ranked_candidate(ranked_candidate, user_input)
+        if simulate_exception:
+            assert res is None
+        else:
+            assert res is validation_res
+
+        # Verify that mock_chat_log.content was restored (keeping only the original user message)
+        assert mock_chat_log.content == [mock_user_message]
+
+
+@pytest.mark.asyncio
+async def test_async_execute_rehydrates_from_candidate_metadata_with_cold_cache() -> None:
+    """Rehydrate execution text without loading intents on the event loop."""
+    entry = MagicMock()
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock()
+    user_input = MockConversationInput("add milk to shopping list", "en")
+    candidate = Candidate(
+        text="add shopping_list_item to shopping list",
+        intent_name="HassShoppingListAddItem",
+        language="en",
+        metadata={
+            "sentence_template": "add {shopping_list_item} to shopping list",
+            "wildcard_slots": "shopping_list_item",
+        },
+    )
+    ranked = RankedCandidate(
+        candidate=candidate,
+        scores=ScoreBreakdown(1.0, 1.0, 1.0, 1.0, 1.0),
+    )
+    validation_result = MagicMock()
+    validation_result.response.error_code = None
+
+    wildcard_slot_names.cache_clear("en")
+    try:
+        with (
+            patch.object(
+                entity,
+                "_delegate_text",
+                AsyncMock(return_value=validation_result),
+            ) as delegate,
+            patch("home_assistant_intents.get_intents") as get_intents,
+        ):
+            result = await entity._async_execute_ranked_candidate(ranked, user_input)
+
+        assert result is validation_result
+        delegate.assert_awaited_once_with(
+            "add milk to shopping list",
+            user_input,
+            primary=True,
+        )
+        get_intents.assert_not_called()
+    finally:
+        wildcard_slot_names.cache_clear("en")
+
+
+class DummyChatLog:
+    """Dummy chat log class for testing."""
+
+    def __init__(self, delta_listener: Any = None) -> None:
+        """Initialize."""
+        self.delta_listener = delta_listener
+
+
+@pytest.fixture
+def conversation_entity() -> STTAssistantConversationEntity:
+    """Fixture to provide an STTAssistantConversationEntity instance."""
+    entry = MagicMock()
+    runtime = STTAssistantRuntime()
+    return STTAssistantConversationEntity(entry, runtime)
+
+
+@pytest.mark.asyncio
+async def test_capture_chat_log_deltas_concurrent(
+    conversation_entity: STTAssistantConversationEntity,
+) -> None:
+    """Test that delta capturing is task-safe under concurrent tasks."""
+    chat_log = DummyChatLog()
+
+    task_1_entered = asyncio.Event()
+    task_2_entered = asyncio.Event()
+
+    async def task_1() -> list[dict]:
+        """First task that captures deltas."""
+        with conversation_entity._capture_chat_log_deltas(chat_log) as deltas:
+            task_1_entered.set()
+            await task_2_entered.wait()
+            if chat_log.delta_listener:
+                chat_log.delta_listener(chat_log, {"text": "task1"})
+            return deltas
+
+    async def task_2() -> list[dict]:
+        """Second task that captures deltas."""
+        await task_1_entered.wait()
+        with conversation_entity._capture_chat_log_deltas(chat_log) as deltas:
+            task_2_entered.set()
+            if chat_log.delta_listener:
+                chat_log.delta_listener(chat_log, {"text": "task2"})
+            return deltas
+
+    res_1, res_2 = await asyncio.gather(task_1(), task_2())
+
+    assert res_1 == [{"text": "task1"}]
+    assert res_2 == [{"text": "task2"}]
+    assert chat_log.delta_listener is None
+
+
+@pytest.mark.asyncio
+async def test_delta_capture_realtime_silence_and_playback(
+    conversation_entity: STTAssistantConversationEntity,
+) -> None:
+    """Test that live deltas are captured and not leaked.
+
+    Deltas should not leak to original listener in real-time, then correctly played back.
+    """
+    orig_called = []
+
+    def orig_listener(log: Any, delta: dict) -> None:
+        """Original listener callback."""
+        orig_called.append(delta)
+
+    chat_log = DummyChatLog(orig_listener)
+
+    with conversation_entity._capture_chat_log_deltas(chat_log) as deltas:
+        # Simulate delta generated during capture
+        assert chat_log.delta_listener is not orig_listener
+        chat_log.delta_listener(chat_log, {"text": "hello"})
+
+        # Verify that original listener has not received it yet
+        assert not orig_called
+        assert deltas == [{"text": "hello"}]
+
+    # Play back deltas
+    conversation_entity._play_back_deltas(chat_log, deltas)
+
+    # Verify that original listener receives the delta exactly once
+    assert orig_called == [{"text": "hello"}]
+
+
+@pytest.mark.asyncio
+async def test_delta_capture_nested_playback_safety(
+    conversation_entity: STTAssistantConversationEntity,
+) -> None:
+    """Test delta playback on nested/concurrent wrappers.
+
+    Ensures it resolves directly to the original listener.
+    """
+    orig_called = []
+
+    def orig_listener(log: Any, delta: dict) -> None:
+        """Original listener callback."""
+        orig_called.append(delta)
+
+    chat_log = DummyChatLog(orig_listener)
+
+    # Task 1 (outer) captures deltas
+    with conversation_entity._capture_chat_log_deltas(chat_log) as outer_deltas:
+        # Task 2 (inner/nested in same task context) captures deltas
+        with conversation_entity._capture_chat_log_deltas(chat_log) as inner_deltas:
+            # Trigger delta
+            chat_log.delta_listener(chat_log, {"text": "inner"})
+            # Verify inner captures it
+            assert inner_deltas == [{"text": "inner"}]
+            # Verify outer has not captured it directly (since ContextVar is active)
+            assert not outer_deltas
+            # Verify original listener is silent
+            assert not orig_called
+
+        # Now back in outer context, inner context is exited.
+        # Play back inner deltas. The delta_listener is still the wrapper.
+        conversation_entity._play_back_deltas(chat_log, inner_deltas)
+
+        # Verify that original listener has received the played back delta
+        assert orig_called == [{"text": "inner"}]
+
+        # Trigger delta in outer context
+        chat_log.delta_listener(chat_log, {"text": "outer"})
+        assert outer_deltas == [{"text": "outer"}]
+
+    # Play back outer deltas
+    conversation_entity._play_back_deltas(chat_log, outer_deltas)
+
+    # Verify original listener receives the outer delta too, exactly once
+    assert orig_called == [{"text": "inner"}, {"text": "outer"}]
+
+
+@pytest.mark.asyncio
+async def test_discover_pipeline_languages_fallback() -> None:
+    """Test fallback logic in pipeline language discovery."""
+    mock_hass = MagicMock()
+    original = stt_assistant.async_get_pipelines
+    stt_assistant.async_get_pipelines = stt_assistant._UNINITIALIZED
+    try:
+        # In the test environment assist_pipeline is not installed, so the import
+        # inside _discover_pipeline_languages raises ImportError and the function
+        # sets async_get_pipelines = None and returns an empty set.
+        langs = _discover_pipeline_languages(mock_hass)
+        assert langs == set()
+    finally:
+        stt_assistant.async_get_pipelines = original
+
+
+@pytest.mark.asyncio
+async def test_capture_chat_log_deltas_exceptional_exit(
+    conversation_entity: STTAssistantConversationEntity,
+) -> None:
+    """Test capture_chat_log_deltas restores listener when exception occurs."""
+    chat_log = DummyChatLog()
+
+    with contextlib.suppress(RuntimeError), conversation_entity._capture_chat_log_deltas(chat_log):
+        raise RuntimeError("exceptional exit")
+    assert chat_log.delta_listener is None
+
+
+@pytest.mark.asyncio
+async def test_capture_chat_log_deltas_normal_exit_restores_listener(
+    conversation_entity: STTAssistantConversationEntity,
+) -> None:
+    """Test capture_chat_log_deltas restores the original listener on normal exit."""
+    chat_log = DummyChatLog()
+    original_listener = object()
+    chat_log.delta_listener = original_listener
+
+    with conversation_entity._capture_chat_log_deltas(chat_log):
+        # Simulate normal usage within the context
+        pass
+
+    # After normal exit, the original listener should be restored
+    assert chat_log.delta_listener is original_listener
+
+
+@pytest.mark.asyncio
+async def test_play_back_deltas_without_listener(
+    conversation_entity: STTAssistantConversationEntity,
+) -> None:
+    """Test play_back_deltas does not raise when original listener is None."""
+    chat_log = DummyChatLog(None)
+    # This should not raise any exceptions
+    conversation_entity._play_back_deltas(chat_log, [{"text": "test"}])
+
+
+@pytest.mark.asyncio
+async def test_async_execute_ranked_candidate_exceptions(
+    conversation_entity: STTAssistantConversationEntity,
+) -> None:
+    """Test that candidate execution returns None on delegate exceptions."""
+    rc = RankedCandidate(
+        candidate=Candidate(text="test", intent_name="test"),
+        scores=ScoreBreakdown(1.0, 1.0, 1.0, 1.0, 1.0),
+    )
+    user_input = MockConversationInput("test", "en")
+
+    with patch.object(
+        conversation_entity,
+        "_delegate_text",
+        side_effect=Exception("delegate exception"),
+    ):
+        res = await conversation_entity._async_execute_ranked_candidate(rc, user_input)
+        assert res is None
+
+
+@pytest.mark.asyncio
+async def test_async_process_fallback_missing(
+    conversation_entity: STTAssistantConversationEntity,
+) -> None:
+    """Test async_process behavior when fallback agent is not found."""
+    # Setup runtime with fallback ID that is missing
+    cast(Any, conversation_entity._entry).options = {"fallback_agent_id": "missing_agent"}
+
+    async def mock_converse(hass, text, conversation_id, context, language, agent_id, **kwargs):
+        """Mock conversation agent fallback target failure."""
+        if agent_id == "missing_agent":
+            raise ValueError("Agent not found")
+        return MagicMock()
+
+    converse_patch = patch(
+        "homeassistant.components.conversation.async_converse",
+        side_effect=mock_converse,
+    )
+    with converse_patch:
+        user_input = MockConversationInput("hello", "en")
+        res = await conversation_entity._async_process_request(user_input)
+        # Should return a default error response when fallback completely fails
+        assert res is not None
+        assert res.response.error_code == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_execution_phase_exception_delegates_to_fallback_agent() -> None:
+    """Unexpected execution errors must reach the fallback agent, not an error result."""
+    entry = MagicMock()
+    entry.options = {"min_confidence": 0.60, "min_margin": 0.05}
+    entry.entry_id = "test_entry"
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+
+    hass = MagicMock()
+    hass.async_create_task = lambda coro: asyncio.create_task(coro)
+    hass.async_add_executor_job = AsyncMock(
+        side_effect=_executor_job_returning_empty_snapshot_index
+    )
+    entity.hass = hass
+    runtime.indexes["vi"] = MagicMock(candidate_count=5)
+
+    accepted = RankedCandidate(
+        candidate=Candidate(text="tắt đèn bếp", intent_name="HassTurnOff"),
+        scores=ScoreBreakdown(
+            rapidfuzz_score=0.9,
+            char_ngram_score=0.9,
+            bm25_score=0.9,
+            intent_score=1.0,
+            final_score=0.9,
+        ),
+    )
+    user_input = MockConversationInput("tắt đèn bếp", "vi")
+
+    with (
+        patch.object(
+            STTAssistantRuntime, "rank_with_dynamic_candidates", return_value=(accepted,)
+        ),
+        patch.object(
+            entity,
+            "_async_execute_accepted_candidates",
+            AsyncMock(side_effect=RuntimeError("registry vanished")),
+        ),
+        patch.object(entity, "_delegate_raw_text", AsyncMock(return_value="raw_delegated")) as raw,
+    ):
+        res = await entity._async_process_with_runtime(user_input)
+
+    assert res == "raw_delegated"
+    raw.assert_awaited_once_with(user_input)
+    assert runtime.diagnostics.last_fallback_reason == FallbackReason.UNEXPECTED_EXCEPTION
+    assert runtime.diagnostics.last_error == "registry vanished"
+
+
+@pytest.mark.asyncio
+async def test_store_load_failure_delegates_to_fallback_agent() -> None:
+    """Index acquisition errors must forward the raw text, not error out."""
+    entry = MagicMock()
+    entry.entry_id = "test_entry"
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock()
+
+    user_input = MockConversationInput("tắt đèn bếp", "vi")
+
+    with (
+        patch.object(
+            STTAssistantRuntime,
+            "async_load_index_from_store",
+            AsyncMock(side_effect=Exception("malformed custom sentences YAML")),
+        ),
+        patch.object(entity, "_delegate_raw_text", AsyncMock(return_value="raw_delegated")) as raw,
+    ):
+        res = await entity._async_process_with_runtime(user_input)
+
+    assert res == "raw_delegated"
+    assert runtime.diagnostics.last_fallback_reason == FallbackReason.EMPTY_INDEX
+    assert "malformed custom sentences YAML" in (runtime.diagnostics.last_error or "")
+    raw.assert_awaited_once_with(user_input)
+
+
+@pytest.mark.asyncio
+async def test_hotword_matched_bypasses_ranking_and_delegates_raw_text() -> None:
+    """A matching hotword must bypass ranking and delegate stripped text directly."""
+    entry = MagicMock()
+    entry.entry_id = "test_entry"
+    entry.options = {
+        ConfigKey.ENABLE_HOTWORD: True,
+        ConfigKey.HOTWORD: "Jarvis",
+    }
+    entry.data = {}
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock()
+
+    user_input = MockConversationInput("Jarvis what is the weather tomorrow", "en")
+
+    with (
+        patch.object(entity, "_delegate_text", AsyncMock(return_value="delegated")) as delegate,
+        patch.object(entity, "_async_rank_request") as rank_mock,
+    ):
+        res = await entity._async_process_with_runtime(user_input)
+
+    assert res == "delegated"
+    delegate.assert_awaited_once_with("what is the weather tomorrow", user_input, primary=False)
+    rank_mock.assert_not_called()
+    assert runtime.diagnostics.last_fallback_reason == FallbackReason.HOTWORD_MATCHED
+    assert runtime.diagnostics.execution_result == "hotword_fallback"
+
+
+@pytest.mark.asyncio
+async def test_hotword_matched_strips_punctuation_and_preserves_hotword_only() -> None:
+    """A matching hotword strips leading punctuation and retains query when hotword-only."""
+    entry = MagicMock()
+    entry.entry_id = "test_entry"
+    entry.options = {
+        ConfigKey.ENABLE_HOTWORD: True,
+        ConfigKey.HOTWORD: "Hey Jarvis",
+    }
+    entry.data = {}
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock()
+
+    # 1. Query with punctuation after hotword
+    user_input1 = MockConversationInput("Hey Jarvis: tell me a joke!", "en")
+    with patch.object(entity, "_delegate_text", AsyncMock(return_value="delegated")) as delegate:
+        res1 = await entity._async_process_with_runtime(user_input1)
+    assert res1 == "delegated"
+    delegate.assert_awaited_once_with("tell me a joke!", user_input1, primary=False)
+
+    # 2. Hotword only input preserves text
+    user_input2 = MockConversationInput("Hey Jarvis", "en")
+    with patch.object(entity, "_delegate_text", AsyncMock(return_value="delegated")) as delegate:
+        res2 = await entity._async_process_with_runtime(user_input2)
+    assert res2 == "delegated"
+    delegate.assert_awaited_once_with("Hey Jarvis", user_input2, primary=False)
+
+
+@pytest.mark.asyncio
+async def test_hotword_disabled_proceeds_to_standard_ranking() -> None:
+    """A disabled hotword configuration must not bypass ranking."""
+    entry = MagicMock()
+    entry.entry_id = "test_entry"
+    entry.options = {
+        ConfigKey.ENABLE_HOTWORD: False,
+        ConfigKey.HOTWORD: "Jarvis",
+    }
+    entry.data = {}
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock()
+
+    user_input = MockConversationInput("Jarvis what is the weather tomorrow", "en")
+
+    with (
+        patch.object(entity, "_delegate_raw_text", AsyncMock(return_value="raw_delegated")) as raw,
+        patch.object(entity, "_async_request_index", AsyncMock(return_value=None)) as req_idx,
+    ):
+        res = await entity._async_process_with_runtime(user_input)
+
+    assert res == "raw_delegated"
+    raw.assert_awaited_once_with(user_input)
+    req_idx.assert_awaited_once_with("en")
+
+
+@pytest.mark.asyncio
+async def test_hotword_enabled_non_matching_query_proceeds_to_ranking() -> None:
+    """An unmatched query with hotword enabled proceeds through the normal ranking pipeline."""
+    entry = MagicMock()
+    entry.entry_id = "test_entry"
+    entry.options = {
+        ConfigKey.ENABLE_HOTWORD: True,
+        ConfigKey.HOTWORD: "Jarvis",
+    }
+    entry.data = {}
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock()
+
+    user_input = MockConversationInput("Turn on the living room light", "en")
+
+    with (
+        patch.object(entity, "_delegate_raw_text", AsyncMock(return_value="raw_delegated")) as raw,
+        patch.object(entity, "_async_request_index", AsyncMock(return_value=None)) as req_idx,
+    ):
+        res = await entity._async_process_with_runtime(user_input)
+
+    assert res == "raw_delegated"
+    raw.assert_awaited_once_with(user_input)
+    req_idx.assert_awaited_once_with("en")
+    assert runtime.diagnostics.last_fallback_reason != FallbackReason.HOTWORD_MATCHED
+
+
+@pytest.mark.asyncio
+async def test_hotword_multiword_and_custom_confidence_matched() -> None:
+    """Multi-word hotword with custom confidence threshold delegates raw text on match."""
+    entry = MagicMock()
+    entry.entry_id = "test_entry"
+    entry.options = {
+        ConfigKey.ENABLE_HOTWORD: True,
+        ConfigKey.HOTWORD: "Hey Jarvis",
+        ConfigKey.HOTWORD_MIN_CONFIDENCE: 0.80,
+    }
+    entry.data = {}
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock()
+
+    user_input = MockConversationInput("Hey Javis turn off everything", "en")
+
+    with (
+        patch.object(entity, "_delegate_text", AsyncMock(return_value="delegated")) as delegate,
+        patch.object(entity, "_async_rank_request") as rank_mock,
+    ):
+        res = await entity._async_process_with_runtime(user_input)
+
+    assert res == "delegated"
+    delegate.assert_awaited_once_with("turn off everything", user_input, primary=False)
+    rank_mock.assert_not_called()
+    assert runtime.diagnostics.last_fallback_reason == FallbackReason.HOTWORD_MATCHED
+
+
+@pytest.mark.asyncio
+async def test_hotword_below_custom_confidence_proceeds_to_ranking() -> None:
+    """When hotword confidence score is below custom threshold, it does not bypass ranking."""
+    entry = MagicMock()
+    entry.entry_id = "test_entry"
+    entry.options = {
+        ConfigKey.ENABLE_HOTWORD: True,
+        ConfigKey.HOTWORD: "Hey Jarvis",
+        ConfigKey.HOTWORD_MIN_CONFIDENCE: 0.98,
+    }
+    entry.data = {}
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock()
+
+    # "Hey Javis" has a typo, score < 0.98 -> does not match
+    user_input = MockConversationInput("Hey Javis turn off everything", "en")
+
+    with (
+        patch.object(entity, "_delegate_raw_text", AsyncMock(return_value="raw_delegated")) as raw,
+        patch.object(entity, "_async_request_index", AsyncMock(return_value=None)) as req_idx,
+    ):
+        res = await entity._async_process_with_runtime(user_input)
+
+    assert res == "raw_delegated"
+    raw.assert_awaited_once_with(user_input)
+    req_idx.assert_awaited_once_with("en")
+    assert runtime.diagnostics.last_fallback_reason != FallbackReason.HOTWORD_MATCHED
+
+
+@pytest.mark.asyncio
+async def test_hotword_list_of_strings_matched() -> None:
+    """List of hotword strings delegates raw text when any item matches."""
+    entry = MagicMock()
+    entry.entry_id = "test_entry"
+    entry.options = {
+        ConfigKey.ENABLE_HOTWORD: True,
+        ConfigKey.HOTWORD: ["Jarvis", "Computer", "Alexa"],
+    }
+    entry.data = {}
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock()
+
+    user_input = MockConversationInput("Computer what time is it", "en")
+
+    with (
+        patch.object(entity, "_delegate_text", AsyncMock(return_value="delegated")) as delegate,
+        patch.object(entity, "_async_rank_request") as rank_mock,
+    ):
+        res = await entity._async_process_with_runtime(user_input)
+
+    assert res == "delegated"
+    delegate.assert_awaited_once_with("what time is it", user_input, primary=False)
+    rank_mock.assert_not_called()
+    assert runtime.diagnostics.last_fallback_reason == FallbackReason.HOTWORD_MATCHED
+
+
+@pytest.mark.asyncio
+async def test_hotword_mixed_invalid_list_filtered_and_matched() -> None:
+    """Non-string and empty hotword entries are filtered and valid entries still match."""
+    entry = MagicMock()
+    entry.entry_id = "test_entry"
+    entry.options = {
+        ConfigKey.ENABLE_HOTWORD: True,
+        ConfigKey.HOTWORD: ["Jarvis", "   ", None, 123],
+    }
+    entry.data = {}
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock()
+
+    user_input = MockConversationInput("Jarvis turn on lights", "en")
+
+    with (
+        patch.object(entity, "_delegate_text", AsyncMock(return_value="delegated")) as delegate,
+        patch.object(entity, "_async_rank_request") as rank_mock,
+    ):
+        res = await entity._async_process_with_runtime(user_input)
+
+    assert res == "delegated"
+    delegate.assert_awaited_once_with("turn on lights", user_input, primary=False)
+    rank_mock.assert_not_called()
+    assert runtime.diagnostics.last_fallback_reason == FallbackReason.HOTWORD_MATCHED
+
+
+def _mock_hotword_entry(
+    confidence: object = None,
+    *,
+    enabled: bool = True,
+    hotwords: Sequence[str] = ("Jarvis",),
+    options: Mapping[str, object] | None = None,
+    data: Mapping[str, object] | None = None,
+) -> MagicMock:
+    """Return a mock config entry configured with hotword options and data."""
+    entry = MagicMock()
+    if options is not None:
+        entry.options = dict(options)
+    elif confidence is not None:
+        entry.options = {
+            ConfigKey.ENABLE_HOTWORD: enabled,
+            ConfigKey.HOTWORD: list(hotwords),
+            ConfigKey.HOTWORD_MIN_CONFIDENCE: confidence,
+        }
+    else:
+        entry.options = {}
+    entry.data = dict(data) if data is not None else {}
+    return entry
+
+
+def test_resolve_entry_hotword_options_fallback_chains() -> None:
+    """Verify resolve_entry_hotword_options fallback across options, data, and defaults."""
+    # 1. Options present and overrides data
+    entry_both = _mock_hotword_entry(
+        0.92,
+        hotwords=("Jarvis", "Alexa"),
+        data={
+            ConfigKey.ENABLE_HOTWORD: False,
+            ConfigKey.HOTWORD: ["OldHotword"],
+            ConfigKey.HOTWORD_MIN_CONFIDENCE: 0.70,
+        },
+    )
+    assert resolve_entry_hotword_options(entry_both) == (True, ("Jarvis", "Alexa"), 0.92)
+
+    # 2. Data only (no options)
+    entry_data = _mock_hotword_entry(
+        options={},
+        data={
+            ConfigKey.ENABLE_HOTWORD: True,
+            ConfigKey.HOTWORD: ["Jarvis"],
+            ConfigKey.HOTWORD_MIN_CONFIDENCE: 0.88,
+        },
+    )
+    assert resolve_entry_hotword_options(entry_data) == (True, ("Jarvis",), 0.88)
+
+    # 3. Neither options nor data (defaults used)
+    assert resolve_entry_hotword_options(_mock_hotword_entry(options={}, data={})) == (
+        False,
+        (),
+        0.85,
+    )
+
+    # 4. None entry (defaults used)
+    assert resolve_entry_hotword_options(None) == (False, (), 0.85)
+
+
+def test_normalize_hotword_list_types_and_edge_cases() -> None:
+    """Verify normalize_hotword_list handles sets, empty states, and invalid types cleanly."""
+    # 1. Empty states
+    assert normalize_hotword_list(None) == []
+    assert normalize_hotword_list(()) == []
+    assert normalize_hotword_list([]) == []
+    assert normalize_hotword_list("") == []
+    assert normalize_hotword_list("   ") == []
+
+    # 2. String input
+    assert normalize_hotword_list("Jarvis") == ["Jarvis"]
+    assert normalize_hotword_list("  Hey Jarvis  ") == ["Hey Jarvis"]
+
+    # 3. Sequence input ordering must be preserved
+    assert normalize_hotword_list(["b", "a"]) == ["b", "a"]
+    assert normalize_hotword_list(("first", "second", "third")) == ["first", "second", "third"]
+
+    # 4. Set input (warns and returns normalized list)
+    assert normalize_hotword_list({"Jarvis"}) == ["Jarvis"]
+
+    # 5. Unexpected types (warns and returns empty list)
+    assert normalize_hotword_list(123) == []
+    assert normalize_hotword_list(True) == []
+    assert normalize_hotword_list({"key": "val"}) == []
+
+
+def test_resolve_entry_hotword_options_defensive_confidence_parsing() -> None:
+    """Verify resolve_entry_hotword_options defensively parses confidence values."""
+    # 1. String float confidence is parsed cleanly
+    _, _, conf = resolve_entry_hotword_options(_mock_hotword_entry("0.95"))
+    assert conf == 0.95
+
+    # 2. Invalid string confidence falls back to default
+    _, _, conf = resolve_entry_hotword_options(_mock_hotword_entry("invalid_not_a_number"))
+    assert conf == 0.85
+
+    # 3. Out-of-bounds values are clamped to [0.0, 1.0]
+    _, _, conf = resolve_entry_hotword_options(_mock_hotword_entry(2.5))
+    assert conf == 1.0
+
+    _, _, conf = resolve_entry_hotword_options(_mock_hotword_entry(-0.5))
+    assert conf == 0.0
+
+    # 4. Non-finite values (NaN, inf, -inf) fall back to default
+    for non_finite in (float("nan"), float("inf"), float("-inf")):
+        _, _, conf = resolve_entry_hotword_options(_mock_hotword_entry(non_finite))
+        assert conf == 0.85
+
+
+def _setup_ranking_cache_test_context() -> tuple[
+    STTAssistantConversationEntity,
+    STTAssistantRuntime,
+    CanonicalIndex,
+    RankedCandidate,
+    ConfidenceGateDecision,
+    MockConversationInput,
+]:
+    """Set up a test entity and runtime pre-populated with a cached ranking."""
+    entry = MagicMock()
+    entry.options = {"min_confidence": 0.60, "min_margin": 0.05}
+    entry.entry_id = "test_entry"
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+
+    user_input = MockConversationInput("turn on the light", "en")
+    cand = Candidate(text="turn on the light", intent_name="HassTurnOn")
+    rc = RankedCandidate(
+        candidate=cand,
+        scores=ScoreBreakdown(
+            rapidfuzz_score=1.0,
+            char_ngram_score=1.0,
+            bm25_score=1.0,
+            intent_score=1.0,
+            final_score=1.0,
+            penalty=0.0,
+        ),
+    )
+    decision = evaluate_confidence_gates((rc,), query="turn on the light", language="en")
+    result = ((rc,), decision)
+
+    index = build_index("en", (cand,))
+    runtime.set_index(index)
+    # Prepopulate ranking cache:
+    runtime.put_cached_ranking(
+        "en",
+        "turn on the light",
+        result,
+        index=index,
+        min_confidence=0.60,
+        min_margin=0.05,
+        expected_generation=runtime.current_cache_generation,
+    )
+    return entity, runtime, index, rc, decision, user_input
+
+
+async def test_async_rank_user_input_cache_hit_avoids_executor() -> None:
+    """Verify that a ranking cache hit in _async_rank_user_input skips async_add_executor_job."""
+    entity, _, index, rc, decision, user_input = _setup_ranking_cache_test_context()
+    hass = MagicMock()
+    entity.hass = hass
+
+    ranked, dec = await entity._async_rank_user_input(user_input, "en", index, 0.60, 0.05)
+
+    assert ranked == (rc,)
+    assert dec == decision
+    # hass.async_add_executor_job must NOT have been called!
+    hass.async_add_executor_job.assert_not_called()
+
+
+async def test_async_rank_user_input_invalidated_cache_calls_executor() -> None:
+    """Verify that an invalidated cache generation misses the cache and invokes the executor."""
+    entity, runtime, index, rc, _, user_input = _setup_ranking_cache_test_context()
+
+    # Invalidate cache generation:
+    runtime.clear_ranking_cache()
+
+    fresh_cand = Candidate(text="turn on the light please", intent_name="HassTurnOn")
+    fresh_rc = RankedCandidate(
+        candidate=fresh_cand,
+        scores=ScoreBreakdown(
+            rapidfuzz_score=0.99,
+            char_ngram_score=0.99,
+            bm25_score=0.99,
+            intent_score=1.0,
+            final_score=0.99,
+            penalty=0.0,
+        ),
+    )
+    fresh_decision = evaluate_confidence_gates(
+        (fresh_rc,), query="turn on the light", language="en"
+    )
+    fresh_result = ((fresh_rc,), fresh_decision)
+
+    hass = MagicMock()
+    hass.async_add_executor_job = AsyncMock(return_value=fresh_result)
+    entity.hass = hass
+
+    ranked, dec = await entity._async_rank_user_input(user_input, "en", index, 0.60, 0.05)
+
+    assert ranked == (fresh_rc,)
+    assert dec == fresh_decision
+    assert ranked != (rc,)
+    hass.async_add_executor_job.assert_called_once()
+
+
+def test_entity_get_hotword_options_caching_and_invalidation() -> None:
+    """Verify _get_hotword_options caches resolved options and re-evaluates on state changes."""
+    entry = MagicMock()
+    entry.options = {
+        ConfigKey.ENABLE_HOTWORD: True,
+        ConfigKey.HOTWORD: ["Jarvis"],
+        ConfigKey.HOTWORD_MIN_CONFIDENCE: 0.90,
+    }
+    entry.data = {}
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+
+    def check_options(
+        expected: tuple[bool, tuple[str, ...], float],
+    ) -> tuple[bool, Sequence[str], float]:
+        options = entity._get_hotword_options()
+        assert options == expected
+        return options
+
+    with patch.object(
+        conversation_platform,
+        "resolve_entry_hotword_options",
+        wraps=resolve_entry_hotword_options,
+    ) as resolver:
+        # First call populates cache; second call reuses it.
+        opts1 = check_options((True, ("Jarvis",), 0.90))
+        opts2 = entity._get_hotword_options()
+        assert opts2 is opts1
+        resolver.assert_called_once_with(entry)
+
+        # Mutate options in entry; the resolver runs again.
+        entry.options = {
+            ConfigKey.ENABLE_HOTWORD: True,
+            ConfigKey.HOTWORD: ["Jarvis", "Hey Jarvis"],
+            ConfigKey.HOTWORD_MIN_CONFIDENCE: 0.85,
+        }
+        opts3 = check_options((True, ("Jarvis", "Hey Jarvis"), 0.85))
+        assert opts3 is not opts1
+        assert resolver.call_count == 2
+
+        # In-place list mutation also invalidates the cache.
+        cast(list[str], entry.options[ConfigKey.HOTWORD]).append("Computer")
+        opts4 = check_options((True, ("Jarvis", "Hey Jarvis", "Computer"), 0.85))
+        assert opts4 is not opts3
+        assert resolver.call_count == 3
+
+
+def test_entity_get_hotword_options_tracks_mutable_sequence_and_snapshots_sets() -> None:
+    """Snapshot mutable sequence contents and keep set snapshots deterministic."""
+    entry = MagicMock()
+    entry.options = {
+        ConfigKey.ENABLE_HOTWORD: True,
+        ConfigKey.HOTWORD: UserList(["Jarvis"]),
+    }
+    entry.data = {}
+    entity = STTAssistantConversationEntity(entry, STTAssistantRuntime())
+
+    opts1 = entity._get_hotword_options()
+    assert opts1 == (True, ("Jarvis",), DEFAULT_HOTWORD_MIN_CONFIDENCE)
+
+    cast(UserList[str], entry.options[ConfigKey.HOTWORD]).append("Computer")
+    opts2 = entity._get_hotword_options()
+    assert opts2 == (True, ("Jarvis", "Computer"), DEFAULT_HOTWORD_MIN_CONFIDENCE)
+    assert opts2 is not opts1
+
+    assert conversation_platform._snapshot_entry_hotword({"Jarvis", "Computer"}) == (
+        "Computer",
+        "Jarvis",
+    )
+
+
+def test_entity_get_hotword_options_tracks_mutable_enable_value() -> None:
+    """Snapshot the effective boolean value of mutable configuration objects."""
+
+    class MutableFlag:
+        """Boolean-like mutable value used to exercise snapshot invalidation."""
+
+        def __init__(self, value: bool) -> None:
+            """Initialize the current truth value."""
+            self.value = value
+
+        def __bool__(self) -> bool:
+            """Return the current truth value."""
+            return self.value
+
+    flag = MutableFlag(True)
+    entry = MagicMock()
+    entry.options = {
+        ConfigKey.ENABLE_HOTWORD: flag,
+        ConfigKey.HOTWORD: ["Jarvis"],
+    }
+    entry.data = {}
+    entity = STTAssistantConversationEntity(entry, STTAssistantRuntime())
+
+    assert entity._get_hotword_options() == (
+        True,
+        ("Jarvis",),
+        DEFAULT_HOTWORD_MIN_CONFIDENCE,
+    )
+
+    flag.value = False
+
+    assert entity._get_hotword_options() == (
+        False,
+        ("Jarvis",),
+        DEFAULT_HOTWORD_MIN_CONFIDENCE,
+    )
+
+
+def test_entity_get_hotword_options_data_fallback_and_defaults() -> None:
+    """Verify _get_hotword_options resolves from data, handles mutations, and uses defaults."""
+    entry = MagicMock()
+    entry.options = {}
+    entry.data = {
+        ConfigKey.ENABLE_HOTWORD: True,
+        ConfigKey.HOTWORD: ["Computer"],
+        ConfigKey.HOTWORD_MIN_CONFIDENCE: 0.95,
+    }
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+
+    # 1. Resolves from entry.data when options is empty
+    opts1 = entity._get_hotword_options()
+    assert opts1 == (True, ("Computer",), 0.95)
+
+    # 2. Mutate entry.data invalidates cache when options is empty
+    entry.data = {
+        ConfigKey.ENABLE_HOTWORD: True,
+        ConfigKey.HOTWORD: ["Computer", "Hal"],
+        ConfigKey.HOTWORD_MIN_CONFIDENCE: 0.88,
+    }
+    opts2 = entity._get_hotword_options()
+    assert opts2 == (True, ("Computer", "Hal"), 0.88)
+    assert opts2 is not opts1
+
+    # 3. entry.options overrides entry.data
+    entry.options = {
+        ConfigKey.ENABLE_HOTWORD: False,
+    }
+    opts3 = entity._get_hotword_options()
+    assert opts3 == (False, ("Computer", "Hal"), 0.88)
+
+    # 4. Absent or false settings return defaults
+    entry.options = {}
+    entry.data = {}
+    opts4 = entity._get_hotword_options()
+    assert opts4 == (False, (), DEFAULT_HOTWORD_MIN_CONFIDENCE)
+
+    # 5. Bare entry without options/data attributes safely returns defaults
+    bare_entry = MagicMock(spec=["entry_id"], entry_id="test_entry")
+    bare_entity = STTAssistantConversationEntity(bare_entry, runtime)
+    opts5 = bare_entity._get_hotword_options()
+    assert opts5 == (False, (), DEFAULT_HOTWORD_MIN_CONFIDENCE)
+
+
+def test_entity_get_hotword_options_distinguishes_absent_from_null() -> None:
+    """An explicit null option overrides the corresponding entry data value."""
+    entry = MagicMock()
+    entry.options = {}
+    entry.data = {
+        ConfigKey.ENABLE_HOTWORD: True,
+        ConfigKey.HOTWORD: ["Jarvis"],
+        ConfigKey.HOTWORD_MIN_CONFIDENCE: 0.95,
+    }
+    entity = STTAssistantConversationEntity(entry, STTAssistantRuntime())
+
+    assert entity._get_hotword_options() == (True, ("Jarvis",), 0.95)
+
+    entry.options = {ConfigKey.HOTWORD: None}
+
+    assert entity._get_hotword_options() == (True, (), 0.95)
+
+
+def test_entity_get_hotword_options_publishes_cache_after_resolution() -> None:
+    """A failed resolution leaves the previous snapshot eligible for a retry."""
+    entry = MagicMock()
+    entry.options = {}
+    entry.data = {ConfigKey.ENABLE_HOTWORD: True, ConfigKey.HOTWORD: ["Jarvis"]}
+    entity = STTAssistantConversationEntity(entry, STTAssistantRuntime())
+    previous_options = entity._get_hotword_options()
+    previous_state = entity._cached_hotword_state
+    entry.options = {ConfigKey.HOTWORD: None}
+
+    with (
+        patch.object(
+            conversation_platform,
+            "resolve_entry_hotword_options",
+            side_effect=RuntimeError("temporary resolver failure"),
+        ),
+        pytest.raises(RuntimeError, match="temporary resolver failure"),
+    ):
+        entity._get_hotword_options()
+
+    assert entity._cached_hotword_options is previous_options
+    assert entity._cached_hotword_state is previous_state
+    assert entity._get_hotword_options() == (True, (), DEFAULT_HOTWORD_MIN_CONFIDENCE)
+
+
+@pytest.mark.asyncio
+async def test_entity_async_reload_clears_hotword_cache() -> None:
+    """Verify async_reload clears cached hotword options."""
+    entry = MagicMock()
+    entry.options = {
+        ConfigKey.ENABLE_HOTWORD: True,
+        ConfigKey.HOTWORD: ["Jarvis"],
+    }
+    entry.data = {}
+    runtime = MagicMock()
+    runtime.async_clear_index = AsyncMock()
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock()
+
+    with patch.object(
+        conversation_platform,
+        "resolve_entry_hotword_options",
+        wraps=resolve_entry_hotword_options,
+    ) as resolver:
+        opts1 = entity._get_hotword_options()
+        assert opts1 == (True, ("Jarvis",), DEFAULT_HOTWORD_MIN_CONFIDENCE)
+        assert entity._cached_hotword_options is not None
+        resolver.assert_called_once_with(entry)
+
+        await entity.async_reload("en")
+
+        assert entity._cached_hotword_options is None
+        assert entity._cached_hotword_state is None
+        assert entity._get_hotword_options() == opts1
+        assert resolver.call_count == 2
+        runtime.async_clear_index.assert_awaited_once_with(entity.hass, "en")
+
+
+def test_entity_is_hotword_matched_with_conversation_input() -> None:
+    """Verify _is_hotword_matched processes ConversationInput with correct stripping and caching."""
+    entry = MagicMock()
+    entry.options = {
+        ConfigKey.ENABLE_HOTWORD: True,
+        ConfigKey.HOTWORD: ["Hey Jarvis", "Computer"],
+        ConfigKey.HOTWORD_MIN_CONFIDENCE: 0.85,
+    }
+    entry.data = {}
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+
+    def assert_matched(text: str, expected_matched: bool, expected_text: str) -> None:
+        matched, stripped = entity._is_hotword_matched(MockConversationInput(text, "en"))
+        assert matched is expected_matched
+        assert stripped == expected_text
+
+    # 1. Matching input with irregular whitespace and punctuation
+    assert_matched("Hey   Jarvis,   turn on the kitchen lights", True, "turn on the kitchen lights")
+
+    # 2. Non-matching input
+    assert_matched("Turn on the living room lights", False, "Turn on the living room lights")
+
+    # 3. Disabled hotword bypasses matching immediately
+    entry.options[ConfigKey.ENABLE_HOTWORD] = False
+    assert_matched("Hey Jarvis, turn on the lights", False, "Hey Jarvis, turn on the lights")
+
+    # 4. Empty or whitespace input
+    assert_matched("", False, "")
+
+
+def _sync_single_item_chat_log(
+    item: object,
+    original_text: str = "orig",
+    stripped_text: str = "stripped",
+) -> MagicMock:
+    """Run _sync_chat_log_current_user_text on a mock chat log with a single item."""
+    chat_log = MagicMock()
+    chat_log.content = [item]
+    STTAssistantConversationEntity._sync_chat_log_current_user_text(
+        chat_log,
+        original_text,
+        stripped_text,
+    )
+    return chat_log
+
+
+def test_sync_chat_log_current_user_text_single_turn() -> None:
+    """Verify _sync_chat_log_current_user_text updates single turn UserContent."""
+    pytest.importorskip("homeassistant.components.conversation.chat_log")
+    from homeassistant.components.conversation.chat_log import UserContent
+
+    msg = UserContent(content="em gái anh đã đậu xe ở đâu")
+    created_time = getattr(msg, "created", None)
+    chat_log = _sync_single_item_chat_log(
+        msg,
+        "em gái anh đã đậu xe ở đâu",
+        "anh đã đậu xe ở đâu",
+    )
+
+    assert len(chat_log.content) == 1
+    assert chat_log.content[0] is not msg
+    assert chat_log.content[0].role == "user"
+    assert chat_log.content[0].content == "anh đã đậu xe ở đâu"
+    assert getattr(chat_log.content[0], "created", None) == created_time
+    assert msg.content == "em gái anh đã đậu xe ở đâu"
+
+
+def test_sync_chat_log_multi_turn_preserves_older_turns() -> None:
+    """Verify older turns in multi-turn sessions remain untouched to preserve LLM caching."""
+    pytest.importorskip("homeassistant.components.conversation.chat_log")
+    from homeassistant.components.conversation.chat_log import AssistantContent, UserContent
+
+    # Turn 1: user used hotword in Turn 1, trimmed, and assistant replied
+    turn1_user = UserContent(content="anh đã đậu xe ở đâu")
+    turn1_assistant = AssistantContent(agent_id="test_agent", content="Anh đã đậu ở tầng B2.")
+    turn1_user_created = getattr(turn1_user, "created", None)
+
+    # Turn 2: user forgot and used hotword again in Turn 2
+    turn2_user = UserContent(content="em gái vậy còn chìa khóa thì sao")
+    turn2_user_created = getattr(turn2_user, "created", None)
+
+    chat_log = MagicMock()
+    chat_log.content = [turn1_user, turn1_assistant, turn2_user]
+
+    # Helper syncs Turn 2
+    STTAssistantConversationEntity._sync_chat_log_current_user_text(
+        chat_log,
+        "em gái vậy còn chìa khóa thì sao",
+        "vậy còn chìa khóa thì sao",
+    )
+
+    # Asserts that Turn 1 is 100% UNTOUCHED (same objects, same content, same created timestamps)
+    assert chat_log.content[0] is turn1_user
+    assert chat_log.content[0].content == "anh đã đậu xe ở đâu"
+    assert getattr(chat_log.content[0], "created", None) == turn1_user_created
+
+    assert chat_log.content[1] is turn1_assistant
+    assert chat_log.content[1].content == "Anh đã đậu ở tầng B2."
+
+    # Asserts that ONLY Turn 2 is updated to the trimmed text
+    assert chat_log.content[2].role == "user"
+    assert chat_log.content[2].content == "vậy còn chìa khóa thì sao"
+    assert getattr(chat_log.content[2], "created", None) == turn2_user_created
+
+    # Turn 3: assistant replied to Turn 2, and user enters Turn 3 with hotword again
+    turn2_assistant = AssistantContent(agent_id="test_agent", content="Chìa khóa ở trên bàn.")
+    turn3_user = UserContent(content="em gái cảm ơn em nhé")
+    turn3_user_created = getattr(turn3_user, "created", None)
+    chat_log.content.extend([turn2_assistant, turn3_user])
+
+    STTAssistantConversationEntity._sync_chat_log_current_user_text(
+        chat_log,
+        "em gái cảm ơn em nhé",
+        "cảm ơn em nhé",
+    )
+
+    # Verify Turns 1 and 2 remain strictly identical
+    assert chat_log.content[0] is turn1_user
+    assert chat_log.content[1] is turn1_assistant
+    assert chat_log.content[2].content == "vậy còn chìa khóa thì sao"
+    assert chat_log.content[3] is turn2_assistant
+
+    # Verify Turn 3 updated
+    assert chat_log.content[4].content == "cảm ơn em nhé"
+    assert getattr(chat_log.content[4], "created", None) == turn3_user_created
+
+
+def test_sync_chat_log_edge_cases_and_non_matching() -> None:
+    """Verify _sync_chat_log_current_user_text handles edge cases gracefully."""
+    pytest.importorskip("homeassistant.components.conversation.chat_log")
+    from homeassistant.components.conversation.chat_log import AssistantContent, UserContent
+
+    # 1. chat_log is None
+    STTAssistantConversationEntity._sync_chat_log_current_user_text(None, "orig", "stripped")
+
+    # 2. chat_log.content is empty
+    empty_log = MagicMock()
+    empty_log.content = []
+    STTAssistantConversationEntity._sync_chat_log_current_user_text(
+        empty_log, "orig", "stripped"
+    )
+    assert not empty_log.content
+
+    def assert_unchanged(msg: object, initial_content: str) -> None:
+        log = _sync_single_item_chat_log(msg, "orig", "stripped")
+        assert log.content[0] is msg
+        assert getattr(log.content[0], "content", None) == initial_content
+
+    # 3. last item is not role "user" (e.g. role "assistant", both mock and dataclass)
+    mock_assistant = MagicMock(role="assistant", content="orig")
+    assert_unchanged(mock_assistant, "orig")
+
+    dataclass_assistant = AssistantContent(agent_id="test_agent", content="orig")
+    assert_unchanged(dataclass_assistant, "orig")
+
+    # 4. last item content does not match original_text (both mock and dataclass)
+    mock_mismatch = MagicMock(role="user", content="different text")
+    assert_unchanged(mock_mismatch, "different text")
+
+    dataclass_mismatch = UserContent(content="different text")
+    assert_unchanged(dataclass_mismatch, "different text")
+
+
+@pytest.mark.asyncio
+async def test_hotword_matched_syncs_active_chat_log() -> None:
+    """Verify hotword match updates active chat log message before fallback delegation."""
+    pytest.importorskip("homeassistant.components.conversation.chat_log")
+    from homeassistant.components.conversation.chat_log import UserContent
+
+    entry = MagicMock()
+    entry.entry_id = "test_entry"
+    entry.options = {
+        ConfigKey.ENABLE_HOTWORD: True,
+        ConfigKey.HOTWORD: "Jarvis",
+    }
+    entry.data = {}
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock()
+
+    user_msg = UserContent(content="Jarvis turn off lights")
+    mock_chat_log = MagicMock()
+    mock_chat_log.content = [user_msg]
+
+    user_input = MockConversationInput("Jarvis turn off lights", "en")
+
+    with (
+        patch.object(entity, "_get_active_chat_log", return_value=mock_chat_log),
+        patch.object(entity, "_delegate_text", AsyncMock(return_value="delegated")) as delegate,
+    ):
+        res = await entity._async_process_with_runtime(user_input)
+
+    assert res == "delegated"
+    delegate.assert_awaited_once_with("turn off lights", user_input, primary=False)
+    assert mock_chat_log.content[0].content == "turn off lights"
+
+
+def test_sync_chat_log_mutable_non_dataclass_item() -> None:
+    """Verify _sync_chat_log_current_user_text updates mutable non-dataclass items in place."""
+    msg = SimpleNamespace(role="user", content="em gái anh đã đậu xe ở đâu")
+    chat_log = _sync_single_item_chat_log(
+        msg,
+        "em gái anh đã đậu xe ở đâu",
+        "anh đã đậu xe ở đâu",
+    )
+
+    assert chat_log.content[0] is msg
+    assert msg.content == "anh đã đậu xe ở đâu"
+
+
+def test_sync_chat_log_empty_stripped_text() -> None:
+    """Verify _sync_chat_log_current_user_text allows updating to an empty stripped text."""
+    pytest.importorskip("homeassistant.components.conversation.chat_log")
+    from homeassistant.components.conversation.chat_log import UserContent
+
+    msg = UserContent(content="Jarvis")
+    chat_log = _sync_single_item_chat_log(
+        msg,
+        "Jarvis",
+        "",
+    )
+
+    assert chat_log.content[0].content == ""
+
+
+@dataclass(frozen=True)
+class _FrozenTestMessage:
+    """Frozen test message dataclass with init=False metadata."""
+
+    content: str
+    role: str = "user"
+    metadata: str = field(init=False, default="cached_metadata")
+
+
+def test_sync_chat_log_frozen_dataclass_preserves_metadata_and_replaces_entry() -> None:
+    """Verify frozen dataclass with init=False metadata is replaced cleanly."""
+    msg = _FrozenTestMessage(content="Jarvis turn on lights")
+    object.__setattr__(msg, "metadata", "custom_cached_value")
+
+    chat_log = _sync_single_item_chat_log(
+        msg,
+        "Jarvis turn on lights",
+        "turn on lights",
+    )
+
+    # Replaced with a new dataclass instance, original frozen object untouched
+    assert chat_log.content[0] is not msg
+    assert chat_log.content[0].content == "turn on lights"
+    assert chat_log.content[0].metadata == "custom_cached_value"
+    assert msg.content == "Jarvis turn on lights"
+    assert msg.metadata == "custom_cached_value"
+
+
+def test_sync_chat_log_dataclass_replace_failure_logs_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verify graceful handling and warning when dataclass replacement fails."""
+    pytest.importorskip("homeassistant.components.conversation.chat_log")
+    from homeassistant.components.conversation.chat_log import UserContent
+
+    msg = UserContent(content="Jarvis turn on lights")
+    with (
+        caplog.at_level(logging.WARNING),
+        patch(
+            "custom_components.stt_assistant.conversation.replace",
+            side_effect=TypeError("Incompatible dataclass fields"),
+        ),
+    ):
+        chat_log = _sync_single_item_chat_log(
+            msg,
+            "Jarvis turn on lights",
+            "turn on lights",
+        )
+
+    # Replacement failed gracefully, log remains unchanged
+    assert chat_log.content[0] is msg
+    assert chat_log.content[0].content == "Jarvis turn on lights"
+    assert "Dataclass replacement failed: Incompatible dataclass fields" in caplog.text
+
+
+def test_sync_chat_log_inspection_failure_logs_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verify failure to inspect active chat log item emits a warning."""
+    from unittest.mock import PropertyMock
+
+    item = MagicMock()
+    type(item).role = PropertyMock(side_effect=RuntimeError("Corrupted role"))
+
+    with caplog.at_level(logging.WARNING):
+        chat_log = _sync_single_item_chat_log(item)
+
+    assert chat_log.content[0] is item
+    assert "Unable to inspect active chat log item: Corrupted role" in caplog.text
+
+
+def test_sync_chat_log_non_dataclass_failure_logs_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verify non-dataclass content update failure emits a warning."""
+
+    class _ReadOnlyContentItem:
+        """Non-dataclass item whose content setter cannot be mutated."""
+
+        def __init__(self) -> None:
+            """Initialize test item."""
+            self.role = "user"
+
+        @property
+        def content(self) -> str:
+            """Return current content."""
+            return "Jarvis turn on lights"
+
+    item = _ReadOnlyContentItem()
+    with caplog.at_level(logging.WARNING):
+        chat_log = _sync_single_item_chat_log(
+            item,
+            "Jarvis turn on lights",
+            "turn on lights",
+        )
+
+    assert chat_log.content[0] is item
+    assert chat_log.content[0].content == "Jarvis turn on lights"
+    assert "Unable to update non-dataclass item content" in caplog.text
+
+
+def test_sync_chat_log_malformed_item_raises_gracefully() -> None:
+    """Verify _sync_chat_log_current_user_text handles malformed items that raise exceptions."""
+    from unittest.mock import PropertyMock
+
+    def assert_malformed_item_unchanged(item: object) -> None:
+        log = _sync_single_item_chat_log(item)
+        assert log.content == [item]
+
+    def make_corrupted_item(attr: str, role: str | None = None) -> MagicMock:
+        item = MagicMock()
+        if role is not None:
+            item.role = role
+        setattr(type(item), attr, PropertyMock(side_effect=RuntimeError(f"Corrupted item {attr}")))
+        return item
+
+    # 1. Accessing role raises RuntimeError
+    assert_malformed_item_unchanged(make_corrupted_item("role"))
+
+    # 2. Accessing content raises RuntimeError
+    assert_malformed_item_unchanged(make_corrupted_item("content", role="user"))
+
+    # 3. Setting content on mutable non-dataclass raises RuntimeError
+    class _BrokenSetterItem:
+        """Non-dataclass item whose content setter raises RuntimeError."""
+
+        def __init__(self) -> None:
+            """Initialize test item."""
+            self.role = "user"
+            self._content = "orig"
+
+        @property
+        def content(self) -> str:
+            """Return current content."""
+            return self._content
+
+        @content.setter
+        def content(self, value: str) -> None:
+            """Raise exception on mutation."""
+            raise RuntimeError("Corrupted content setter")
+
+    broken_setter_item = _BrokenSetterItem()
+    assert_malformed_item_unchanged(broken_setter_item)
+    assert broken_setter_item.content == "orig"
+
+
+def test_sync_chat_log_tuple_sequence_replaces_collection_on_chat_log() -> None:
+    """Verify sequence replacement when chat_log.content is an immutable tuple."""
+    pytest.importorskip("homeassistant.components.conversation.chat_log")
+    from homeassistant.components.conversation.chat_log import ChatLog, UserContent
+
+    class _TupleBackedChatLog:
+        """Chat log test double with an immutable tuple sequence for content."""
+
+        def __init__(self, content: tuple[UserContent, ...]) -> None:
+            """Initialize the tuple-backed chat log double."""
+            self._content = content
+
+        @property
+        def content(self) -> Sequence[UserContent]:
+            """Return current immutable content tuple."""
+            return self._content
+
+        @content.setter
+        def content(self, value: Sequence[UserContent]) -> None:
+            """Assign replacement sequence as an immutable tuple."""
+            self._content = tuple(value)
+
+    msg = UserContent(content="Jarvis turn on lights")
+    chat_log = _TupleBackedChatLog((msg,))
+
+    STTAssistantConversationEntity._sync_chat_log_current_user_text(
+        cast(ChatLog, chat_log),
+        "Jarvis turn on lights",
+        "turn on lights",
+    )
+
+    assert len(chat_log.content) == 1
+    assert chat_log.content[0] is not msg
+    assert chat_log.content[0].content == "turn on lights"
+    assert isinstance(chat_log.content, tuple)
+
+
+def test_sync_chat_log_sequence_replacement_failure_logs_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verify sequence replacement failure is logged as warning when content is read-only."""
+    pytest.importorskip("homeassistant.components.conversation.chat_log")
+    from homeassistant.components.conversation.chat_log import ChatLog, UserContent
+
+    class _ReadOnlyChatLog:
+        """Chat log test double with a read-only property."""
+
+        def __init__(self, content: tuple[UserContent, ...]) -> None:
+            """Initialize the read-only chat log double."""
+            self._content = content
+
+        @property
+        def content(self) -> Sequence[UserContent]:
+            """Return current immutable content tuple without setter."""
+            return self._content
+
+    msg = UserContent(content="Jarvis turn on lights")
+    chat_log = _ReadOnlyChatLog((msg,))
+
+    with caplog.at_level(logging.WARNING):
+        STTAssistantConversationEntity._sync_chat_log_current_user_text(
+            cast(ChatLog, chat_log),
+            "Jarvis turn on lights",
+            "turn on lights",
+        )
+
+    assert len(chat_log.content) == 1
+    assert chat_log.content[0] is msg
+    assert "Failed to update chat log sequence" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_hotword_only_input_with_active_chat_log() -> None:
+    """Verify hotword-only input retains text and updates active chat log accordingly."""
+    pytest.importorskip("homeassistant.components.conversation.chat_log")
+    from homeassistant.components.conversation.chat_log import UserContent
+
+    entry = MagicMock()
+    entry.entry_id = "test_entry"
+    entry.options = {
+        ConfigKey.ENABLE_HOTWORD: True,
+        ConfigKey.HOTWORD: "Jarvis",
+    }
+    entry.data = {}
+    runtime = STTAssistantRuntime()
+    entity = STTAssistantConversationEntity(entry, runtime)
+    entity.hass = MagicMock()
+
+    user_msg = UserContent(content="Jarvis")
+    mock_chat_log = MagicMock()
+    mock_chat_log.content = [user_msg]
+
+    user_input = MockConversationInput("Jarvis", "en")
+
+    with (
+        patch.object(entity, "_get_active_chat_log", return_value=mock_chat_log),
+        patch.object(entity, "_delegate_text", AsyncMock(return_value="delegated")) as delegate,
+    ):
+        res = await entity._async_process_with_runtime(user_input)
+
+    assert res == "delegated"
+    delegate.assert_awaited_once_with("Jarvis", user_input, primary=False)
+    assert mock_chat_log.content[0].content == "Jarvis"

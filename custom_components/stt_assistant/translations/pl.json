@@ -1,0 +1,101 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "STT Assistant",
+        "description": "Skonfiguruj STT Assistant, aby wstępnie przetwarzać i kanonizować żądania Assist.",
+        "data": {
+          "fallback_agent_id": "Zapasowy agent konwersacyjny",
+          "min_confidence": "Minimalna pewność dopasowania",
+          "min_margin": "Bazowy margines pewności",
+          "enable_hotword": "Włącz pomijanie za pomocą słowa kluczowego",
+          "hotword": "Własne słowo kluczowe",
+          "hotword_min_confidence": "Pewność dopasowania słowa kluczowego"
+        }
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Dozwolona jest tylko jedna instancja STT Assistant."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Opcje STT Assistant",
+        "description": "Skonfiguruj zachowanie i ustawienia STT Assistant.",
+        "data": {
+          "fallback_agent_id": "Zapasowy agent konwersacyjny",
+          "min_confidence": "Minimalna pewność dopasowania",
+          "min_margin": "Bazowy margines pewności",
+          "enable_hotword": "Włącz pomijanie za pomocą słowa kluczowego",
+          "hotword": "Własne słowo kluczowe",
+          "hotword_min_confidence": "Pewność dopasowania słowa kluczowego"
+        }
+      }
+    }
+  },
+  "services": {
+    "set_fallback_agent": {
+      "name": "Ustaw zapasowego agenta",
+      "description": "Zmienia zapasowego agenta konwersacyjnego używanego dla przyszłych żądań.",
+      "fields": {
+        "agent_id": {
+          "name": "Agent konwersacyjny",
+          "description": "Agent konwersacyjny używany, gdy STT Assistant przechodzi na tryb zapasowy."
+        }
+      }
+    },
+    "test_match": {
+      "name": "Testuj dopasowanie",
+      "description": "Zwraca uszeregowanych kandydatów dla wprowadzonego tekstu z oceną leksykalną i niestandardowymi progami.",
+      "fields": {
+        "text": {
+          "name": "Tekst",
+          "description": "Tekst wejściowy do kanonizacji i dopasowania."
+        },
+        "language": {
+          "name": "Język",
+          "description": "Język tekstu wejściowego. W przypadku pominięcia używany jest język skonfigurowany w Home Assistant."
+        }
+      }
+    },
+    "rebuild_index": {
+      "name": "Odbuduj indeks",
+      "description": "Odbudowuje jeden indeks językowy z automatycznych źródeł kandydatów.",
+      "fields": {
+        "language": {
+          "name": "Język",
+          "description": "Język indeksu do odbudowania. W przypadku pominięcia używany jest język skonfigurowany w Home Assistant."
+        }
+      }
+    },
+    "clear_index": {
+      "name": "Wyczyść indeks",
+      "description": "Czyści jeden indeks językowy lub wszystkie indeksy.",
+      "fields": {
+        "language": {
+          "name": "Język",
+          "description": "Język indeksu do wyczyszczenia. W przypadku pominięcia czyszczone są wszystkie indeksy językowe."
+        }
+      }
+    },
+    "diagnostics": {
+      "name": "Diagnostyka",
+      "description": "Zwraca diagnostykę czasu wykonania dla STT Assistant."
+    },
+    "dump_candidates": {
+      "name": "Eksportuj kandydatów",
+      "description": "Zwraca szczegóły puli kandydatów dla języka.",
+      "fields": {
+        "language": {
+          "name": "Język",
+          "description": "Język puli kandydatów do zrzutu. W przypadku pominięcia używany jest język skonfigurowany w Home Assistant."
+        },
+        "rebuild": {
+          "name": "Odbuduj",
+          "description": "Wymusza odbudowę indeksu przed zrzutem."
+        }
+      }
+    }
+  }
+}

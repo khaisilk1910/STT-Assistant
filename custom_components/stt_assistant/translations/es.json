@@ -1,0 +1,101 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "STT Assistant",
+        "description": "Configura STT Assistant para preprocesar y canonizar solicitudes de Assist.",
+        "data": {
+          "fallback_agent_id": "Agente de conversación de respaldo",
+          "min_confidence": "Confianza mínima de coincidencia",
+          "min_margin": "Margen base de confianza",
+          "enable_hotword": "Habilitar omisión por palabra de activación",
+          "hotword": "Palabra de activación personalizada",
+          "hotword_min_confidence": "Confianza de coincidencia de palabra de activación"
+        }
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Solo se permite una única instancia de STT Assistant."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Opciones de STT Assistant",
+        "description": "Configure el comportamiento y los ajustes de STT Assistant.",
+        "data": {
+          "fallback_agent_id": "Agente de conversación de respaldo",
+          "min_confidence": "Confianza mínima de coincidencia",
+          "min_margin": "Margen base de confianza",
+          "enable_hotword": "Habilitar omisión por palabra de activación",
+          "hotword": "Palabra de activación personalizada",
+          "hotword_min_confidence": "Confianza de coincidencia de palabra de activación"
+        }
+      }
+    }
+  },
+  "services": {
+    "set_fallback_agent": {
+      "name": "Establecer agente de respaldo",
+      "description": "Cambia el agente de conversación de respaldo utilizado para solicitudes futuras.",
+      "fields": {
+        "agent_id": {
+          "name": "Agente de conversación",
+          "description": "El agente de conversación que se utilizará cuando STT Assistant recurra al respaldo."
+        }
+      }
+    },
+    "test_match": {
+      "name": "Probar coincidencia",
+      "description": "Devuelve candidatos clasificados para una entrada de texto con puntuación léxica y umbrales personalizados.",
+      "fields": {
+        "text": {
+          "name": "Texto",
+          "description": "El texto de entrada para canonizar y comparar."
+        },
+        "language": {
+          "name": "Idioma",
+          "description": "El idioma del texto de entrada. Si se omite, se utiliza el idioma configurado en Home Assistant."
+        }
+      }
+    },
+    "rebuild_index": {
+      "name": "Reconstruir índice",
+      "description": "Reconstruye un índice de idioma a partir de fuentes de candidatos automáticas.",
+      "fields": {
+        "language": {
+          "name": "Idioma",
+          "description": "El idioma del índice a reconstruir. Si se omite, se utiliza el idioma configurado en Home Assistant."
+        }
+      }
+    },
+    "clear_index": {
+      "name": "Limpiar índice",
+      "description": "Limpia un índice de idioma o todos los índices.",
+      "fields": {
+        "language": {
+          "name": "Idioma",
+          "description": "El idioma del índice a limpiar. Si se omite, se limpian todos los índices de idioma."
+        }
+      }
+    },
+    "diagnostics": {
+      "name": "Diagnóstico",
+      "description": "Devuelve diagnósticos de tiempo de ejecución para STT Assistant."
+    },
+    "dump_candidates": {
+      "name": "Exportar candidatos",
+      "description": "Devuelve los detalles del grupo de candidatos para un idioma.",
+      "fields": {
+        "language": {
+          "name": "Idioma",
+          "description": "El idioma del grupo de candidatos a volcar. Si se omite, se utiliza el idioma configurado en Home Assistant."
+        },
+        "rebuild": {
+          "name": "Reconstruir",
+          "description": "Fuerza la reconstrucción del índice antes de volcar."
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,101 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "STT Assistant",
+        "description": "Configure o STT Assistant para pré-processar e canonizar solicitações do Assist.",
+        "data": {
+          "fallback_agent_id": "Agente de conversa de fallback",
+          "min_confidence": "Confiança mínima de correspondência",
+          "min_margin": "Margem base de confiança",
+          "enable_hotword": "Ativar desvio por palavra de ativação",
+          "hotword": "Palavra de ativação personalizada",
+          "hotword_min_confidence": "Confiança de correspondência da palavra de ativação"
+        }
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Apenas uma única instância do STT Assistant é permitida."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Opções do STT Assistant",
+        "description": "Configure o comportamento e as configurações do STT Assistant.",
+        "data": {
+          "fallback_agent_id": "Agente de conversa de fallback",
+          "min_confidence": "Confiança mínima de correspondência",
+          "min_margin": "Margem base de confiança",
+          "enable_hotword": "Ativar desvio por palavra de ativação",
+          "hotword": "Palavra de ativação personalizada",
+          "hotword_min_confidence": "Confiança de correspondência da palavra de ativação"
+        }
+      }
+    }
+  },
+  "services": {
+    "set_fallback_agent": {
+      "name": "Definir agente de fallback",
+      "description": "Altera o agente de conversa de fallback usado em solicitações futuras.",
+      "fields": {
+        "agent_id": {
+          "name": "Agente de conversa",
+          "description": "O agente de conversa a usar quando o STT Assistant recorrer ao fallback."
+        }
+      }
+    },
+    "test_match": {
+      "name": "Testar correspondência",
+      "description": "Retorna candidatos classificados para uma entrada de texto com pontuação lexical e limites personalizados.",
+      "fields": {
+        "text": {
+          "name": "Texto",
+          "description": "O texto de entrada para canonizar e corresponder."
+        },
+        "language": {
+          "name": "Idioma",
+          "description": "O idioma do texto de entrada. Se omitido, usa o idioma configurado no Home Assistant."
+        }
+      }
+    },
+    "rebuild_index": {
+      "name": "Reconstruir índice",
+      "description": "Reconstrói um índice de idioma a partir de fontes automáticas de candidatos.",
+      "fields": {
+        "language": {
+          "name": "Idioma",
+          "description": "O idioma do índice a reconstruir. Se omitido, usa o idioma configurado no Home Assistant."
+        }
+      }
+    },
+    "clear_index": {
+      "name": "Limpar índice",
+      "description": "Limpa um índice de idioma ou todos os índices.",
+      "fields": {
+        "language": {
+          "name": "Idioma",
+          "description": "O idioma do índice a limpar. Se omitido, todos os índices de idioma são limpos."
+        }
+      }
+    },
+    "diagnostics": {
+      "name": "Diagnóstico",
+      "description": "Retorna diagnósticos de tempo de execução para o STT Assistant."
+    },
+    "dump_candidates": {
+      "name": "Exportar candidatos",
+      "description": "Retorna detalhes do pool de candidatos para um idioma.",
+      "fields": {
+        "language": {
+          "name": "Idioma",
+          "description": "O idioma do pool de candidatos a despejar. Se omitido, usa o idioma configurado no Home Assistant."
+        },
+        "rebuild": {
+          "name": "Reconstruir",
+          "description": "Força a reconstrução do índice antes de despejar."
+        }
+      }
+    }
+  }
+}

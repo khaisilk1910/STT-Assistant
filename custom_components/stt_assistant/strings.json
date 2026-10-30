@@ -1,0 +1,101 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "STT Assistant",
+        "description": "Configure the STT Assistant integration to preprocess and canonicalize Assist requests.",
+        "data": {
+          "fallback_agent_id": "Fallback Conversation Agent",
+          "min_confidence": "Minimum Match Confidence",
+          "min_margin": "Base Confidence Margin",
+          "enable_hotword": "Enable Hot Word Bypass",
+          "hotword": "Custom Hot Word",
+          "hotword_min_confidence": "Hot Word Match Confidence"
+        }
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Only a single instance of STT Assistant is allowed."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "STT Assistant Options",
+        "description": "Configure settings and behavior for STT Assistant.",
+        "data": {
+          "fallback_agent_id": "Fallback Conversation Agent",
+          "min_confidence": "Minimum Match Confidence",
+          "min_margin": "Base Confidence Margin",
+          "enable_hotword": "Enable Hot Word Bypass",
+          "hotword": "Custom Hot Word",
+          "hotword_min_confidence": "Hot Word Match Confidence"
+        }
+      }
+    }
+  },
+  "services": {
+    "set_fallback_agent": {
+      "name": "Set fallback agent",
+      "description": "Change the fallback conversation agent used for future requests.",
+      "fields": {
+        "agent_id": {
+          "name": "Conversation agent",
+          "description": "The conversation agent to use when STT Assistant falls back."
+        }
+      }
+    },
+    "test_match": {
+      "name": "Test match",
+      "description": "Return ranked candidates for a text input using lexical scoring and custom thresholds.",
+      "fields": {
+        "text": {
+          "name": "Text",
+          "description": "The input text to canonicalize and match."
+        },
+        "language": {
+          "name": "Language",
+          "description": "The language of the input text. If omitted, falls back to the Home Assistant configuration language."
+        }
+      }
+    },
+    "rebuild_index": {
+      "name": "Rebuild index",
+      "description": "Rebuild the search index for a language from automatic candidate sources.",
+      "fields": {
+        "language": {
+          "name": "Language",
+          "description": "The language of the index to rebuild. If omitted, falls back to the Home Assistant configuration language."
+        }
+      }
+    },
+    "clear_index": {
+      "name": "Clear index",
+      "description": "Clear a language index or all indexes.",
+      "fields": {
+        "language": {
+          "name": "Language",
+          "description": "The language of the index to clear. If omitted, all language indexes are cleared."
+        }
+      }
+    },
+    "diagnostics": {
+      "name": "Diagnostics",
+      "description": "Return runtime diagnostics for STT Assistant."
+    },
+    "dump_candidates": {
+      "name": "Dump candidates",
+      "description": "Return candidate pool details for a specific language.",
+      "fields": {
+        "language": {
+          "name": "Language",
+          "description": "The language of the candidate pool to dump. If omitted, falls back to the Home Assistant configuration language."
+        },
+        "rebuild": {
+          "name": "Rebuild",
+          "description": "Force an index rebuild before dumping."
+        }
+      }
+    }
+  }
+}

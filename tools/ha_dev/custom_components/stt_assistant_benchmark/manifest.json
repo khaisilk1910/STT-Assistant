@@ -1,0 +1,22 @@
+{
+  "domain": "stt_assistant_benchmark",
+  "name": "STT Assistant Benchmark Fixture",
+  "codeowners": ["@khaisilk1910"],
+  "dependencies": [
+    "climate",
+    "conversation",
+    "demo",
+    "humidifier",
+    "intent",
+    "lawn_mower",
+    "lock",
+    "media_player",
+    "siren",
+    "todo"
+  ],
+  "documentation": "https://github.com/khaisilk1910/STT-Assistant",
+  "integration_type": "service",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/khaisilk1910/STT-Assistant/issues",
+  "version": "1.0.0"
+}

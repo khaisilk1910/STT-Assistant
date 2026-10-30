@@ -1,0 +1,28 @@
+homeassistant:
+  name: STT Assistant Benchmark Home
+  latitude: 0.0
+  longitude: 0.0
+  elevation: 0
+  unit_system: metric
+  currency: USD
+  country: US
+  time_zone: UTC
+  language: en
+
+frontend:
+
+config:
+
+conversation:
+
+assist_pipeline:
+
+demo:
+
+stt_assistant_benchmark:
+
+logger:
+  default: info
+  logs:
+    custom_components.stt_assistant: debug
+    custom_components.stt_assistant_benchmark: debug

@@ -1,0 +1,101 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "STT Assistant",
+        "description": "Configureer STT Assistant om Assist-verzoeken voor te verwerken en te canoniseren.",
+        "data": {
+          "fallback_agent_id": "Fallback-gespreksagent",
+          "min_confidence": "Minimale matchbetrouwbaarheid",
+          "min_margin": "Basisbetrouwbaarheidsmarge",
+          "enable_hotword": "Hotword-bypass inschakelen",
+          "hotword": "Aangepast hotword",
+          "hotword_min_confidence": "Hotword-overeenkomst betrouwbaarheid"
+        }
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Er is slechts één instantie van STT Assistant toegestaan."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "STT Assistant-opties",
+        "description": "Configureer het gedrag en de instellingen voor STT Assistant.",
+        "data": {
+          "fallback_agent_id": "Fallback-gespreksagent",
+          "min_confidence": "Minimale matchbetrouwbaarheid",
+          "min_margin": "Basisbetrouwbaarheidsmarge",
+          "enable_hotword": "Hotword-bypass inschakelen",
+          "hotword": "Aangepast hotword",
+          "hotword_min_confidence": "Hotword-overeenkomst betrouwbaarheid"
+        }
+      }
+    }
+  },
+  "services": {
+    "set_fallback_agent": {
+      "name": "Fallback-agent instellen",
+      "description": "Wijzigt de fallback-gespreksagent voor toekomstige verzoeken.",
+      "fields": {
+        "agent_id": {
+          "name": "Gespreksagent",
+          "description": "De gespreksagent die STT Assistant bij een fallback gebruikt."
+        }
+      }
+    },
+    "test_match": {
+      "name": "Match testen",
+      "description": "Retourneert gerangschikte kandidaten voor een tekstinvoer met lexicale scoring en aangepaste drempels.",
+      "fields": {
+        "text": {
+          "name": "Tekst",
+          "description": "De invoertekst om te canoniseren en te matchen."
+        },
+        "language": {
+          "name": "Taal",
+          "description": "De taal van de invoertekst. Indien weggelaten, wordt de in Home Assistant geconfigureerde taal gebruikt."
+        }
+      }
+    },
+    "rebuild_index": {
+      "name": "Index opnieuw opbouwen",
+      "description": "Bouwt één taalindex opnieuw op vanuit automatische kandidaatbronnen.",
+      "fields": {
+        "language": {
+          "name": "Taal",
+          "description": "De taal van de opnieuw op te bouwen index. Indien weggelaten, wordt de in Home Assistant geconfigureerde taal gebruikt."
+        }
+      }
+    },
+    "clear_index": {
+      "name": "Index wissen",
+      "description": "Wist één taalindex of alle indexen.",
+      "fields": {
+        "language": {
+          "name": "Taal",
+          "description": "De taal van de te wissen index. Indien weggelaten, worden alle taalindexen gewist."
+        }
+      }
+    },
+    "diagnostics": {
+      "name": "Diagnostiek",
+      "description": "Retourneert runtime-diagnostiek voor STT Assistant."
+    },
+    "dump_candidates": {
+      "name": "Kandidaten exporteren",
+      "description": "Retourneert details van de kandidaatpool voor een taal.",
+      "fields": {
+        "language": {
+          "name": "Taal",
+          "description": "De taal van de te dumpen kandidaatpool. Indien weggelaten, wordt de in Home Assistant geconfigureerde taal gebruikt."
+        },
+        "rebuild": {
+          "name": "Opnieuw opbouwen",
+          "description": "Dwingt het opnieuw opbouwen van de index af vóór het dumpen."
+        }
+      }
+    }
+  }
+}

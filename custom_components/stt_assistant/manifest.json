@@ -1,0 +1,20 @@
+{
+  "domain": "stt_assistant",
+  "name": "STT Assistant",
+  "codeowners": [
+    "@khaisilk1910"
+  ],
+  "config_flow": true,
+  "dependencies": [
+    "conversation"
+  ],
+  "documentation": "https://github.com/khaisilk1910/STT-Assistant",
+  "integration_type": "service",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/khaisilk1910/STT-Assistant/issues",
+  "requirements": [
+    "rapidfuzz>=3.14.2"
+  ],
+  "single_config_entry": true,
+  "version": "1.17.0"
+}
