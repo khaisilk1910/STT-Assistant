@@ -1414,6 +1414,7 @@ class STTAssistantRuntime:
         last_error: str | None = None,
         dynamic_candidate_count: int | None = None,
         last_request_id: str | None = None,
+        last_trace_id: str | None = None,
         selected_delegated_text_hash: str | None = None,
         selected_candidate_source: str | None = None,
         confidence_gate: Mapping[str, JsonValueType] | None = None,
@@ -1457,6 +1458,7 @@ class STTAssistantRuntime:
                     "last_query_latency_ms": last_query_latency_ms,
                     "dynamic_candidate_count": dynamic_candidate_count,
                     "last_request_id": last_request_id,
+                    "last_trace_id": last_trace_id,
                     "selected_delegated_text_hash": selected_delegated_text_hash,
                     "selected_candidate_source": selected_candidate_source,
                     "confidence_gate": dict(confidence_gate)
