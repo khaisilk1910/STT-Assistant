@@ -61,6 +61,7 @@ from .ranking import (
     rank_candidates,
 )
 from .rehydration import clear_rehydration_caches
+from .registry import async_registry_slot_values
 from .utils import (
     clear_utils_caches,
     elapsed_ms,
@@ -240,6 +241,7 @@ class STTAssistantRuntime:
     language_intent_sources: dict[str, dict[str, IntentSource]] = field(default_factory=dict)
     config_path: Callable[..., str] | None = None
     registry_slot_values: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    registry_initialized: bool = False
     registry_slot_index: RegistrySlotIndex = field(default_factory=lambda: RegistrySlotIndex({}))
     registry_slot_indexes: dict[str, RegistrySlotIndex] = field(default_factory=dict)
     dynamic_registry_intents: dict[str, tuple[DynamicRegistryIntent, ...]] = field(
@@ -512,6 +514,7 @@ class STTAssistantRuntime:
         """Rebuild one language index once while concurrent callers await it."""
         if self._closed:
             return None
+        self.ensure_registry_snapshot(hass)
         language = normalize_language(language)
         generation = self._index_generation_for(language)
         task = self._active_rebuild_task(language, generation)
@@ -539,6 +542,9 @@ class STTAssistantRuntime:
         self, hass: HomeAssistant, language: str
     ) -> CanonicalIndex | None:
         """Load an index only when its persisted source fingerprint is current."""
+        if self._closed:
+            return None
+        self.ensure_registry_snapshot(hass)
         if not self._start_index_load():
             return None
         try:
@@ -995,6 +1001,16 @@ class STTAssistantRuntime:
             self.config_path = config_path
             self._invalidate_source_dependent_indexes(clear_sources=True)
 
+    def ensure_registry_snapshot(self, hass: HomeAssistant) -> None:
+        """Hydrate Assist-exposed names on first use, not during HA startup.
+
+        Registry reads must run in Home Assistant's event loop. Index build
+        methods call this before taking their source fingerprint; normal warmup
+        calls it after startup, while early requests trigger it on demand.
+        """
+        if not self._closed and not self.registry_initialized:
+            self.update_registry_slot_values(async_registry_slot_values(hass))
+
     def update_registry_slot_values(self, slot_values: Mapping[str, tuple[str, ...]]) -> bool:
         """Update cached registry metadata used for candidate expansion.
 
@@ -1003,12 +1019,20 @@ class STTAssistantRuntime:
         """
         updated_values = {key: tuple(values) for key, values in slot_values.items()}
         with self._source_cache_lock:
-            if self._closed or updated_values == self.registry_slot_values:
+            if self._closed:
                 return False
+            if updated_values == self.registry_slot_values:
+                self.registry_initialized = True
+                return False
+        # A failed index build must not mark hydration complete: the next
+        # background or on-demand attempt must be allowed to retry.
         updated_index = build_registry_slot_index(updated_values)
         registry_record_count = updated_index.record_count
         with self._source_cache_lock:
-            if self._closed or updated_values == self.registry_slot_values:
+            if self._closed:
+                return False
+            self.registry_initialized = True
+            if updated_values == self.registry_slot_values:
                 return False
             self.registry_generation += 1
             self.registry_slot_values = updated_values
@@ -1384,6 +1408,7 @@ class STTAssistantRuntime:
             self.language_intent_sources.clear()
             self._language_source_generations.clear()
             self.registry_slot_values.clear()
+            self.registry_initialized = False
             self.registry_slot_index = RegistrySlotIndex({})
             self.registry_slot_indexes.clear()
             self._registry_slot_index_generations.clear()

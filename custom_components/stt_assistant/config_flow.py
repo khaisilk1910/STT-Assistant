@@ -18,7 +18,7 @@ from homeassistant.components.conversation.agent_manager import get_agent_manage
 from homeassistant.components.conversation.const import DATA_COMPONENT, HOME_ASSISTANT_AGENT
 from homeassistant.components.conversation.entity import ConversationEntity
 from homeassistant.config_entries import ConfigFlowResult
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.selector import (
     BooleanSelector,
     NumberSelector,
@@ -60,35 +60,33 @@ class STTAssistantConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_create_entry(title=NAME, data=user_input)
 
     @staticmethod
+    @callback
     def async_get_options_flow(
         config_entry: config_entries.ConfigEntry,
     ) -> config_entries.OptionsFlow:
-        """Return the options flow."""
-        return STTAssistantOptionsFlow(config_entry)
+        """Return the options flow; Home Assistant injects its entry later."""
+        return STTAssistantOptionsFlow()
 
 
 class STTAssistantOptionsFlow(config_entries.OptionsFlow):
     """Handle STT Assistant options."""
 
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        """Initialize options flow."""
-        self._config_entry = config_entry
-
     async def async_step_init(
         self, user_input: dict[str, object] | None = None
     ) -> ConfigFlowResult:
         """Manage STT Assistant options."""
-        current = {**self._config_entry.data, **self._config_entry.options}
-        if user_input is None:
-            return self.async_show_form(
-                step_id="init",
-                data_schema=_config_schema(
-                    self.hass,
-                    current,
-                    exclude_agent_id=self._config_entry.entry_id,
-                ),
-            )
-        return self.async_create_entry(title="", data=user_input)
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+        entry = self.config_entry
+        current = {**entry.data, **entry.options}
+        return self.async_show_form(
+            step_id="init",
+            data_schema=_config_schema(
+                self.hass,
+                current,
+                exclude_agent_id=entry.entry_id,
+            ),
+        )
 
 
 def _config_schema(

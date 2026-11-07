@@ -66,6 +66,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     No index is built in this method. All expensive warmup work is delayed
     until after Home Assistant has finished starting.
     """
+    setup_started = time.monotonic()
     runtime = STTAssistantRuntime()
     runtime.configure_config_path(hass.config.path)
     domain_data = hass.data.setdefault(DOMAIN, {})
@@ -76,7 +77,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     platform_setup_attempted = False
     try:
         _subscribe_intent_updates(hass, runtime)
-        _refresh_registry_slot_values(hass, runtime)
+        # Registry names and candidate indexing can be large on busy homes.
+        # First hydration runs after HA startup, or on an early request.
         _subscribe_registry_updates(hass, runtime)
 
         platform_setup_attempted = True
@@ -106,8 +108,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, schedule_after_start)
             )
         _LOGGER.info(
-            "STT Assistant entry initialized; conversation agent ready, warmup scheduled "
-            "15s after Home Assistant startup"
+            "STT Assistant entry initialized setup_ms=%.1f; agent ready, "
+            "registry hydration and warmup deferred until after startup",
+            (time.monotonic() - setup_started) * 1000,
         )
         return True
     except BaseException:
@@ -289,6 +292,7 @@ def _discover_pipeline_languages(hass: HomeAssistant) -> set[str]:
     try:
         pipelines = pipeline_getter(hass)
     except Exception:
+        _LOGGER.debug("Unable to enumerate Assist pipelines during warmup", exc_info=True)
         return languages
 
     for pipeline in pipelines:
@@ -344,6 +348,16 @@ async def _async_warmup_pipeline_languages(
     runtime: STTAssistantRuntime,
 ) -> None:
     """Discover configured pipeline languages and warm every index in the background."""
+    if runtime.closed:
+        return
+    try:
+        runtime.ensure_registry_snapshot(hass)
+    except Exception:
+        _LOGGER.warning(
+            "Registry hydration failed during background warmup; retry on demand",
+            exc_info=True,
+        )
+        return
     if runtime.closed:
         return
     languages = _discover_pipeline_languages(hass)
