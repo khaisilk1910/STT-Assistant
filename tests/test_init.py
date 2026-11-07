@@ -146,6 +146,7 @@ async def test_async_setup_entry(
     assert hass.data[DOMAIN][entry.entry_id]["entry"] is entry
     runtime = hass.data[DOMAIN][entry.entry_id][DATA_RUNTIME]
     assert isinstance(runtime, STTAssistantRuntime)
+    assert not runtime.registry_initialized  # no full registry scan in setup_entry
     assert _async_update_listener in entry.update_listeners
     assert entry._on_unload is not None
     assert len(entry._on_unload) == 1

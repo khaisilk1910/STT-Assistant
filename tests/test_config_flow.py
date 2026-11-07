@@ -2,7 +2,7 @@
 
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 from homeassistant.core import HomeAssistant
@@ -264,11 +264,15 @@ async def test_options_flow_steps() -> None:
         options={},
     )
 
-    flow = STTAssistantOptionsFlow(entry)
+    flow = STTAssistantOptionsFlow()
     flow.hass = MagicMock()
 
-    # 1. No input shows form
-    with patch.object(flow, "async_show_form", return_value="show_form_result"):
+    # 1. No input shows form and obtains entry from Home Assistant
+    with (
+        patch.object(STTAssistantOptionsFlow, "config_entry", new_callable=PropertyMock) as entry_prop,
+        patch.object(flow, "async_show_form", return_value="show_form_result"),
+    ):
+        entry_prop.return_value = entry
         res = await flow.async_step_init(None)
         assert res == "show_form_result"
 

@@ -3421,3 +3421,51 @@ def test_set_index_preserves_language_index_generation_for_concurrent_rebuilds()
     runtime.clear_index("en")
     assert runtime._index_generation_for("en") != initial_gen
     assert runtime_module._index_load_invalidated(runtime, "en", initial_gen, source_gen)
+
+
+
+
+def test_failed_registry_hydration_can_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Do not persist an incomplete registry snapshot after an index build error."""
+    runtime = STTAssistantRuntime()
+    hass = MagicMock()
+    monkeypatch.setattr(
+        runtime_module,
+        "async_registry_slot_values",
+        MagicMock(return_value={"name": ("Desk lamp",)}),
+    )
+    original_build = runtime_module.build_registry_slot_index
+    calls = 0
+
+    def intermittently_failing_build(values: Mapping[str, tuple[str, ...]]) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("temporary registry index failure")
+        return original_build(values)
+
+    monkeypatch.setattr(runtime_module, "build_registry_slot_index", intermittently_failing_build)
+    with pytest.raises(RuntimeError, match="temporary registry index failure"):
+        runtime.ensure_registry_snapshot(hass)
+    assert not runtime.registry_initialized
+    assert runtime.registry_slot_values == {}
+
+    runtime.ensure_registry_snapshot(hass)
+    assert runtime.registry_initialized
+    assert runtime.registry_slot_values["name"] == ("Desk lamp",)
+    assert calls == 2
+
+def test_registry_snapshot_is_lazy_and_loaded_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Do not traverse the registry until the first index request or warmup."""
+    runtime = STTAssistantRuntime()
+    hass = MagicMock()
+    scan = MagicMock(return_value={"name": ("Desk lamp",)})
+    monkeypatch.setattr(runtime_module, "async_registry_slot_values", scan)
+
+    assert not runtime.registry_initialized
+    assert scan.call_count == 0
+    runtime.ensure_registry_snapshot(hass)
+    assert runtime.registry_initialized
+    assert runtime.registry_slot_values["name"] == ("Desk lamp",)
+    runtime.ensure_registry_snapshot(hass)
+    scan.assert_called_once_with(hass)

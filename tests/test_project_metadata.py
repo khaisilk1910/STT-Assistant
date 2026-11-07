@@ -16,6 +16,8 @@ def test_metadata_minimum_versions_and_domain_match() -> None:
     lock = tomllib.loads((ROOT / "uv.lock").read_text())
     assert manifest["domain"] == "stt_assistant"
     assert manifest["name"] == "STT Assistant"
+    assert manifest["categories"] == ["ai_voice.voice_assistants"]
+    assert "render_readme" not in hacs
     assert manifest["config_flow"] is True
     assert manifest["single_config_entry"] is True
     assert "assist_pipeline" not in manifest.get("after_dependencies", [])
