@@ -20,7 +20,7 @@
 </div>
 
 > [!NOTE]
-> This is a **community integration**, not an official Home Assistant component, and has not yet passed full real-world Home Assistant testing. The GitHub repository must contain the integration source before HACS can download it. The button above opens the repository in HACS; it **does not automatically install** the integration.
+> This is a **community integration**, not an official Home Assistant component, and has not yet passed full real-world Home Assistant testing. The GitHub repository must contain the integration source before HACS can download it. The button above opens the repository in the **Marketplace** (HA 2026.11+) or **HACS** (HA 2026.10); it **does not automatically install** the integration.
 
 ## What is STT Assistant?
 
@@ -40,19 +40,16 @@ It is **not** an audio STT engine, wake-word detector or TTS engine. Those stage
 
 ## 📥 Installation
 
-### Option 1 — HACS (recommended)
+### Option 1 — Marketplace on Home Assistant 2026.11+ (recommended)
 
-[![Add STT Assistant to HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=khaisilk1910&repository=STT-Assistant&category=integration)
+1. Open **Settings → Marketplace** (built in; **do not install standalone HACS**).
+2. Search for **STT Assistant**. If it is not in the catalog, connect GitHub and add the public custom repository `https://github.com/khaisilk1910/STT-Assistant` as an **Integration**.
+3. Select **Install**. On first installation the Marketplace can load a new config-flow integration immediately; follow the restart repair after updating an integration already in use.
+4. Open **Settings → Devices & services → Add integration**, configure **STT Assistant**, then select it as the Assist Pipeline's Conversation Agent.
 
-1. Install [HACS](https://www.hacs.xyz/) if needed.
-2. Click the button above, or open **HACS → ⋮ → Custom repositories** and enter:
-   - **Repository:** `https://github.com/khaisilk1910/STT-Assistant`
-   - **Type / Category:** `Integration`
-3. Open STT Assistant in HACS and select **Download**.
-4. **Restart Home Assistant.**
+[Open the repository](https://my.home-assistant.io/redirect/hacs_repository/?owner=khaisilk1910&repository=STT-Assistant&category=integration): the original HACS repository links continue to work in the Marketplace. The GitHub repository must exist and pass Marketplace checks; a locally downloaded ZIP does not get automatically published there.
 
-> [!IMPORTANT]
-> HACS can only download this custom integration once valid source files have been pushed to the repository. A **custom repository** is not the same as an approved HACS default repository.
+**Home Assistant 2026.10:** use standalone **HACS → ⋮ → Custom repositories**, select **Integration**, install and restart. The declared minimum HA version remains 2026.10; test the 2026.11 changes on a real Home Assistant installation before wide deployment.
 
 ### Option 2 — Manual installation
 
@@ -90,19 +87,19 @@ logger:
     custom_components.stt_assistant: info  # switch to debug when troubleshooting
 ```
 
-If `logger:` already exists, **merge** this entry into the existing section instead of defining it twice. INFO logs include routing decisions and total time; DEBUG logs include per-stage timing. See the [logging guide](LOGGING_STT_ASSISTANT.md) and [validation notes](RELEASE_VALIDATION.md).
+If `logger:` already exists, **merge** this entry into the existing section instead of defining it twice. INFO logs include routing decisions, total time and entry setup duration; DEBUG logs include per-stage timing. The config-entry menu under **Settings → Devices & services** also offers **Download diagnostics**, which excludes utterances, hotwords, entity names and request IDs. See the [logging guide](LOGGING_STT_ASSISTANT.md) and [validation notes](RELEASE_VALIDATION.md).
 
 ## ⚠️ Risks and recommendations
 
 - **Wrong intent execution:** text similarity cannot guarantee the intended action. Carefully test **on/off and lock/unlock** requests, especially with similar device names. Start with default thresholds; do not lower them blindly.
 - **Performance:** initial indexing may use CPU/RAM and slow the first request; performance depends on your hardware and entity count.
-- **Compatibility:** source version 1.17.0 declares **Home Assistant ≥ 2026.10.0**, but end-to-end operation has not been certified on a real instance. Back up before installing and use a test instance if possible.
+- **Compatibility:** source version 1.18.0 declares **Home Assistant ≥ 2026.10.0**, but end-to-end operation has not been certified on a real instance. Back up before installing and use a test instance if possible.
 - **Migration:** the new domain `stt_assistant` does **not** automatically migrate `assist_canonicalizer` config entries. Follow the [migration guide](MIGRATION_STT_ASSISTANT.md); **do not edit** `.storage` directly.
 - **Privacy:** the new INFO/DEBUG logging does not deliberately include transcripts; Home Assistant or other agents can still write sensitive data. Review logs before sharing and consider cloud fallback privacy.
 - **Not an STT replacement:** an upstream engine that completely misrecognizes an utterance may not be recoverable.
 
 ## 📚 Documentation and support
 
-[Logging](LOGGING_STT_ASSISTANT.md) · [Domain migration](MIGRATION_STT_ASSISTANT.md) · [Validation limits](RELEASE_VALIDATION.md) · [Brand assets](BRANDING.md) · [GitHub Issues](https://github.com/khaisilk1910/STT-Assistant/issues)
+[Logging](LOGGING_STT_ASSISTANT.md) · [Domain migration](MIGRATION_STT_ASSISTANT.md) · [Marketplace 2026.11 audit](MARKETPLACE_2026_11_AUDIT.vi.md) · [Validation limits](RELEASE_VALIDATION.md) · [Brand assets](BRANDING.md) · [GitHub Issues](https://github.com/khaisilk1910/STT-Assistant/issues)
 
 **Project:** [github.com/khaisilk1910/STT-Assistant](https://github.com/khaisilk1910/STT-Assistant) · **License:** [LICENSE](LICENSE)

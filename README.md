@@ -13,14 +13,14 @@
 [![GitHub](https://img.shields.io/badge/GitHub-STT--Assistant-181717?logo=github)](https://github.com/khaisilk1910/STT-Assistant)
 [![License](https://img.shields.io/github/license/khaisilk1910/STT-Assistant)](LICENSE)
 
-[![Thêm vào HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=khaisilk1910&repository=STT-Assistant&category=integration)
+[![Mở Marketplace](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=khaisilk1910&repository=STT-Assistant&category=integration)
 
 **[Tải bản phát hành](https://github.com/khaisilk1910/STT-Assistant/releases) · [Báo lỗi / Góp ý](https://github.com/khaisilk1910/STT-Assistant/issues)**
 
 </div>
 
 > [!NOTE]
-> Đây là **tích hợp cộng đồng**, không phải thành phần chính thức của Home Assistant và chưa được xác nhận kiểm thử đầy đủ trên Home Assistant thực tế. Repository GitHub cần có mã nguồn trước khi HACS có thể tải tích hợp. Nút bên trên mở trang repository trong HACS, **không tự động cài đặt**.
+> Đây là **tích hợp cộng đồng**, không phải thành phần chính thức của Home Assistant và chưa được xác nhận kiểm thử đầy đủ trên Home Assistant thực tế. Repository GitHub cần có mã nguồn trước khi HACS có thể tải tích hợp. Nút bên trên mở repository trong **Marketplace** (HA 2026.11+) hoặc **HACS** (HA 2026.10), **không tự động cài đặt**.
 
 ## STT Assistant là gì?
 
@@ -40,19 +40,16 @@
 
 ## 📥 Cài đặt
 
-### Cách 1 — HACS (khuyên dùng)
+### Cách 1 — Marketplace trên Home Assistant 2026.11+ (khuyên dùng)
 
-[![Thêm STT Assistant vào HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=khaisilk1910&repository=STT-Assistant&category=integration)
+1. Mở **Settings → Marketplace** (được tích hợp sẵn, **không cài thêm HACS**).
+2. Tìm **STT Assistant**. Nếu chưa có trong catalog, kết nối GitHub và thêm custom repository công khai: `https://github.com/khaisilk1910/STT-Assistant` (loại **Integration**).
+3. Chọn **Install** (hoặc tương đương). Khi cài mới với config flow, Marketplace có thể tải tích hợp trực tiếp; khi nâng cấp gói đã được nạp, hãy làm theo thông báo yêu cầu khởi động lại.
+4. Vào **Settings → Devices & services → Add integration**, thêm **STT Assistant**, rồi chọn làm Conversation Agent của Assist Pipeline.
 
-1. Cài [HACS](https://www.hacs.xyz/) nếu chưa có.
-2. Bấm nút trên. Nếu không mở được, vào **HACS → ⋮ → Custom repositories** và thêm:
-   - **Repository:** `https://github.com/khaisilk1910/STT-Assistant`
-   - **Type / Category:** `Integration`
-3. Mở STT Assistant trong HACS và chọn **Download**.
-4. **Khởi động lại Home Assistant.**
+[Nút mở repository](https://my.home-assistant.io/redirect/hacs_repository/?owner=khaisilk1910&repository=STT-Assistant&category=integration) vẫn tương thích Marketplace. Repository phải thực sự tồn tại trên GitHub và đáp ứng điều kiện Marketplace; ZIP trong máy không được Marketplace tự lấy lên.
 
-> [!IMPORTANT]
-> HACS chỉ có thể tải sau khi repository đã có mã nguồn hợp lệ. Đây là **custom repository**; không có nghĩa tích hợp đã được duyệt vào kho HACS mặc định.
+**Home Assistant 2026.10:** dùng giao diện HACS cũ, thêm repository ở **HACS → ⋮ → Custom repositories**, chọn **Integration**, tải xuống rồi khởi động lại. Mã nguồn vẫn khai báo mức tối thiểu 2026.10; các thay đổi 2026.11 cần được thử nghiệm trên Home Assistant thực tế trước khi phát hành rộng rãi.
 
 ### Cách 2 — Cài thủ công
 
@@ -90,19 +87,19 @@ logger:
     custom_components.stt_assistant: info  # đổi thành debug khi cần điều tra
 ```
 
-Nếu đã có `logger:`, **gộp** dòng `custom_components.stt_assistant` vào khối đang dùng, không tạo khối `logger:` thứ hai. Log INFO cho biết nhánh xử lý và thời gian; DEBUG hiển thị thời gian từng giai đoạn. Xem thêm [hướng dẫn logging](LOGGING_STT_ASSISTANT.vi.md) và [chẩn đoán/kiểm thử](RELEASE_VALIDATION.vi.md).
+Nếu đã có `logger:`, **gộp** dòng `custom_components.stt_assistant` vào khối đang dùng, không tạo khối `logger:` thứ hai. Log INFO cho biết nhánh xử lý, thời gian yêu cầu và thời gian thiết lập entry; DEBUG hiển thị thời gian từng giai đoạn. Có thể tải **Diagnostics** từ menu ba chấm của entry trong **Settings → Devices & services** (không gồm câu nói, hotword, tên thiết bị, ID yêu cầu). Xem thêm [hướng dẫn logging](LOGGING_STT_ASSISTANT.vi.md) và [chẩn đoán/kiểm thử](MARKETPLACE_2026_11_AUDIT.vi.md).
 
 ## ⚠️ Rủi ro & khuyến cáo
 
 - **Thực thi sai intent:** tương đồng văn bản không bảo đảm đúng ý; kiểm tra kỹ các câu **bật/tắt, khóa/mở khóa**, tên thiết bị gần giống. Dùng ngưỡng mặc định trước, không hạ ngưỡng tùy tiện.
 - **Hiệu năng:** xây chỉ mục lần đầu có thể tăng CPU/RAM và khiến lệnh đầu tiên chậm; hiệu quả phụ thuộc cấu hình, số entity và máy chủ.
-- **Tương thích:** bản mã nguồn 1.17.0 khai báo **Home Assistant ≥ 2026.10.0**, nhưng chưa được chứng nhận end-to-end trên hệ thống thật. Sao lưu trước khi cài và kiểm thử trên instance phụ nếu có.
+- **Tương thích:** bản mã nguồn 1.18.0 khai báo **Home Assistant ≥ 2026.10.0**, nhưng chưa được chứng nhận end-to-end trên hệ thống thật. Sao lưu trước khi cài và kiểm thử trên instance phụ nếu có.
 - **Nâng cấp từ tên cũ:** domain mới `stt_assistant` **không tự chuyển cấu hình** của `assist_canonicalizer`. Xem [hướng dẫn chuyển đổi](MIGRATION_STT_ASSISTANT.vi.md); **không sửa trực tiếp** `.storage`.
 - **Riêng tư:** tích hợp không chủ động log transcript ở INFO/DEBUG mới, nhưng agent khác và Home Assistant có thể ghi dữ liệu nhạy cảm. Kiểm tra log trước khi chia sẻ; cân nhắc cloud fallback.
 - **Không thay thế STT engine:** nếu engine nhận sai hoàn toàn câu nói, tích hợp có thể không khôi phục được ý định đúng.
 
 ## 📚 Tài liệu & hỗ trợ
 
-[Logging](LOGGING_STT_ASSISTANT.vi.md) · [Chuyển đổi domain](MIGRATION_STT_ASSISTANT.vi.md) · [Giới hạn kiểm thử](RELEASE_VALIDATION.vi.md) · [Brand assets](BRANDING.md) · [GitHub Issues](https://github.com/khaisilk1910/STT-Assistant/issues)
+[Logging](LOGGING_STT_ASSISTANT.vi.md) · [Chuyển đổi domain](MIGRATION_STT_ASSISTANT.vi.md) · [Rà soát Marketplace 2026.11](MARKETPLACE_2026_11_AUDIT.vi.md) · [Giới hạn kiểm thử](RELEASE_VALIDATION.vi.md) · [Brand assets](BRANDING.md) · [GitHub Issues](https://github.com/khaisilk1910/STT-Assistant/issues)
 
 **Dự án:** [github.com/khaisilk1910/STT-Assistant](https://github.com/khaisilk1910/STT-Assistant) · **Giấy phép:** [LICENSE](LICENSE)
